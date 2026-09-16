@@ -1,0 +1,26 @@
+{
+  "apiVersion": "67.0",
+  "excludeIdsFromCSVFiles": "true",
+  "objectSets": [
+    {
+      "objects": [
+        {
+          "query": "SELECT AccountSource, AnnualRevenue, BillingCity, BillingCountry, BillingPostalCode, BillingState, BillingStreet,ChannelProgramLevelName, ChannelProgramName, CurrencyIsoCode, Description, Fax, Id, Industry, MasterRecordId, Name, NumberOfEmployees, ParentId, Phone, PhotoUrl, ShippingCity, ShippingCountry, ShippingPostalCode, ShippingState, ShippingStreet, Type, Website FROM Account",
+          "operation": "Upsert",
+          "externalId": "Name"
+        },
+        {
+          "query": "SELECT AccountId, FirstName, LastName, Name FROM Contact",
+          "operation": "Upsert",
+          "externalId": "Name"
+        },
+        {
+          "query": "SELECT AccountId, Account.Name, AddTaxIdentificationDetails, BillDayOfMonth, BillingResumptionDate, BillingSuspensionDate, BillToContactId, BillToContact.Name, CurrencyIsoCode, DeliveryTerms, DoesSkipAutomaticPayments, EmailTemplateId, EmailTemplate.Name, InvoiceDocumentTemplateId, InvoiceDocumentTemplate.Name, IsDefaultBillingProfile, Name, PaymentTermId, PaymentTerm.Name, PrimaryBillAddrCity, PrimaryBillAddrCountry, PrimaryBillAddrGeocodeAccuracy, PrimaryBillAddrPostalCode, PrimaryBillAddrState, PrimaryBillAddrStreet, SavedPaymentMethodId, SavedPaymentMethod.Name, ShouldAttachInvoiceDocToEmail, TaxExemptionExpirationDate, TaxExemptionNumber, TaxExemptionStatus, TaxIdentificationNumber FROM BillingAccount",
+          "operation": "Upsert",
+          "externalId": "Name"
+        }
+      ]
+    }
+  ],
+  "orgs": []
+}

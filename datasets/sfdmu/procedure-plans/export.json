@@ -1,0 +1,48 @@
+{
+  "apiVersion": "67.0",
+  "excludeIdsFromCSVFiles": "true",
+  "useSeparatedCSVFiles": true,
+  "objectSets": [
+    {
+      "name": "First Pass - Upsert ProcedurePlanSections",
+      "objects": [
+        {
+          "query": "SELECT Description, DeveloperName, Language, MasterLabel, PrimaryObject, ProcessType FROM ProcedurePlanDefinition",
+          "operation": "Readonly",
+          "externalId": "DeveloperName"
+        },
+        {
+          "query": "SELECT DefaultReadContextMapping, DefaultSaveContextMapping, DeveloperName, EffectiveFrom, EffectiveTo, InheritedFrom, IsActive, ProcedurePlanDefinitionId, Rank FROM ProcedurePlanDefinitionVersion",
+          "operation": "Readonly",
+          "externalId": "DeveloperName"
+        },
+        {
+          "query": "SELECT Description, Phase, ProcedurePlanVersionId, ResolutionType, SectionType, Sequence, SubSectionType FROM ProcedurePlanSection",
+          "operation": "Upsert",
+          "externalId": "SubSectionType;Sequence"
+        }
+      ]
+    },
+    {
+      "name": "Second Pass - Upsert ProcedurePlanOptions with ExpressionSet Links",
+      "objects": [
+        {
+          "query": "SELECT SubSectionType, Sequence, ProcedurePlanVersionId FROM ProcedurePlanSection",
+          "operation": "Readonly",
+          "externalId": "SubSectionType;Sequence"
+        },
+        {
+          "query": "SELECT DeveloperName, MasterLabel FROM ExpressionSetDefinition",
+          "operation": "Readonly",
+          "externalId": "DeveloperName"
+        },
+        {
+          "query": "SELECT ProcedurePlanSectionId, ExpressionSetDefinitionId, Priority, CriteriaLogic, ReadContextMapping, SaveContextMapping, ProcedurePlanSection.SubSectionType FROM ProcedurePlanOption",
+          "operation": "Upsert",
+          "externalId": "ProcedurePlanSection.SubSectionType;Priority"
+        }
+      ]
+    }
+  ],
+  "orgs": []
+}

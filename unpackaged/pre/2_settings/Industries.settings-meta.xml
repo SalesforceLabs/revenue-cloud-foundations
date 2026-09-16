@@ -1,0 +1,21 @@
+<?xml version='1.0' encoding='utf-8'?>
+<IndustriesSettings xmlns="http://soap.sforce.com/2006/04/metadata">
+    <enableAccountScoreEnabled>false</enableAccountScoreEnabled>
+    <enableContractMgmtPref>true</enableContractMgmtPref>
+    <enableDataTrueUpPreference>true</enableDataTrueUpPreference>
+    <enableDiscoveryFrameworkMetadata>true</enableDiscoveryFrameworkMetadata>
+    <enableDontSharePartyprofWPortalOrgPref>false</enableDontSharePartyprofWPortalOrgPref>
+    <enableEnhancedQuestionCreation>true</enableEnhancedQuestionCreation>
+    <enableEpcDeleteAccess>false</enableEpcDeleteAccess>
+    <enableIndustriesAssessment>true</enableIndustriesAssessment>
+    <enableIndustriesAssessmentPrefill>false</enableIndustriesAssessmentPrefill>
+    <enableIndustriesIntegrationOrchestratorPref>false</enableIndustriesIntegrationOrchestratorPref>
+    <enableMicrosoftWordAddInEnabled>true</enableMicrosoftWordAddInEnabled>
+    <enableNewTimelineSetupFlow>true</enableNewTimelineSetupFlow>
+    <enablePCMConfigRules>false</enablePCMConfigRules>
+    <enablePartyProfileParentSharingOrgPref>false</enablePartyProfileParentSharingOrgPref>
+    <enablePartyprofParentMultiSharingOrgPref>false</enablePartyprofParentMultiSharingOrgPref>
+    <enableTimelinePref>true</enableTimelinePref>
+    <partyProfMultiShrPrtnrsOrgPref>false</partyProfMultiShrPrtnrsOrgPref>
+    <rlaEditIfAccHasEdit>false</rlaEditIfAccHasEdit>
+</IndustriesSettings>

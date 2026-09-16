@@ -1,0 +1,1407 @@
+import json
+import os
+import re
+import requests
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from abc import abstractmethod
+from typing import Dict, Any, List, Optional
+
+# ANSI escape code pattern for stripping color codes from subprocess output.
+# SFDMU and other CLI tools emit color codes; stripping them improves log readability.
+ANSI_ESCAPE_PATTERN = re.compile(r'\x1b\[[0-9;]*m')
+
+# Note: If CumulusCI is not installed, you'll need to install it or mock these imports for development.
+try:
+    from cumulusci.core.config import ScratchOrgConfig
+    from cumulusci.tasks.salesforce import BaseSalesforceTask
+    from cumulusci.tasks.sfdx import SFDXBaseTask
+    from cumulusci.core.exceptions import TaskOptionsError, CommandException
+    from cumulusci.core.keychain import BaseProjectKeychain
+except ImportError:
+    print("CumulusCI not found. Please install it or mock these imports for development.")
+    # For development without CumulusCI, you can use:
+    # ScratchOrgConfig = object
+    # SFDXBaseTask = object
+    # TaskOptionsError = Exception
+    # CommandException = Exception
+    # BaseProjectKeychain = object
+
+# Constants
+LOAD_COMMAND = "sf sfdmu run --sourceusername CSVFILE --targetusername {targetusername} -p {pathtoexportjson} --canmodify {instanceurl} --noprompt --verbose"
+SCRATCHORG_LOAD_COMMAND = "sf sfdmu run --sourceusername CSVFILE --targetusername {targetusername} -p {pathtoexportjson} --canmodify {instanceurl} --noprompt --verbose"
+EXTRACT_COMMAND = "sf sfdmu run --sourceusername {sourceusername} --targetusername CSVFILE -p {pathtoexportjson} --noprompt --verbose"
+EXPORT_JSON_FILENAME = "export.json"
+DRO_ASSIGNED_TO_PLACEHOLDER = "__DRO_ASSIGNED_TO_USER__"
+DRO_CSV_FILES_TO_REPLACE = ("FulfillmentStepDefinition.csv", "User.csv", "UserAndGroup.csv")
+
+
+def strip_ansi_codes(text: str) -> str:
+    """Strip ANSI escape codes from subprocess output for readable logs."""
+    return ANSI_ESCAPE_PATTERN.sub('', text)
+
+
+def derive_qb_reference_plan_dir(plan_dir: str) -> Optional[str]:
+    """Derive the qb/en-US 'golden' sibling of a variant plan directory.
+
+    Plans live at ``datasets/sfdmu/<variant>/<locale>/<variant>-<suffix>`` (e.g.
+    ``datasets/sfdmu/q3/en-US/q3-rates``).  The canonical reference is the qb,
+    en-US plan with the same suffix (``datasets/sfdmu/qb/en-US/qb-rates``).  ja
+    plans (``datasets/sfdmu/qb/ja/qb-pricing``) derive to their en-US counterpart.
+
+    Returns the reference path only when it exists on disk and differs from the
+    plan itself (so qb/en-US plans don't align to themselves); otherwise None.
+    """
+    plan_dir = os.path.normpath(plan_dir)
+    parts = plan_dir.split(os.sep)
+    try:
+        sroot = len(parts) - 1 - parts[::-1].index("sfdmu")
+    except ValueError:
+        return None
+    sfdmu_root = os.sep.join(parts[: sroot + 1])
+    plan_name = parts[-1]
+    if "-" not in plan_name:
+        return None
+    suffix = plan_name.split("-", 1)[1]
+    reference = os.path.join(sfdmu_root, "qb", "en-US", f"qb-{suffix}")
+    if os.path.normpath(reference) == plan_dir:
+        return None
+    if not os.path.isfile(os.path.join(reference, EXPORT_JSON_FILENAME)):
+        return None
+    return reference
+
+
+def run_post_process_script(
+    extraction_dir: str,
+    plan_dir: str,
+    output_dir: str,
+    cwd: Optional[str] = None,
+    logger: Optional[Any] = None,
+    reference_plan_dir: Optional[str] = None,
+    code_map_file: Optional[str] = None,
+    copy_to_plan: bool = False,
+) -> None:
+    """Run post_process_extraction.py to make extracted CSVs v5 import-ready ($$ columns, header normalization).
+    Shared by ExtractSFDMUData and TestSFDMUIdempotency.
+
+    When ``reference_plan_dir`` is given it is passed as ``--reference-plan-dir`` so
+    the processed CSVs are aligned to that reference plan's (golden) column schema
+    rather than to the target plan's own (possibly stale) CSVs.
+
+    When ``code_map_file`` is given it is passed as ``--code-map-file`` so the
+    post-process can backfill cross-object externalId code components (e.g.
+    UsageResource.Code) that SFDMU blanked to #N/A during extraction.
+    """
+    cwd = cwd or os.getcwd()
+    script = os.path.join(cwd, "scripts", "post_process_extraction.py")
+    if not os.path.isfile(script):
+        raise FileNotFoundError(f"Post-process script not found: {script}")
+    cmd = [sys.executable, script, extraction_dir, plan_dir, "--output-dir", output_dir]
+    if reference_plan_dir:
+        cmd += ["--reference-plan-dir", reference_plan_dir]
+    if code_map_file:
+        cmd += ["--code-map-file", code_map_file]
+    if copy_to_plan:
+        cmd += ["--copy-to-plan"]
+    if logger:
+        logger.info(f"Running post-process: {shlex.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+    if logger:
+        for line in (result.stdout or "").splitlines():
+            logger.info(strip_ansi_codes(line))
+    if result.returncode != 0:
+        if logger:
+            for line in (result.stderr or "").splitlines():
+                logger.error(strip_ansi_codes(line))
+        raise CommandException(f"Post-process failed with exit code {result.returncode}")
+    if logger and result.stderr:
+        for line in result.stderr.splitlines():
+            logger.warning(strip_ansi_codes(line))
+
+
+class LoadSFDMUData(SFDXBaseTask):
+    keychain_class = BaseProjectKeychain
+    task_options: Dict[str, Dict[str, Any]] = {
+        "pathtoexportjson": {
+            "description": "Directory path to the export.json to upload",
+            "required": True
+        },
+        "targetusername": {
+            "description": "Username or AccessToken of the account that will be used to upload the data",
+            "required": False
+        },
+        "instanceurl": {
+            "description": "Instance url for the targetusername.",
+            "required": False
+        },
+        "accesstoken": {
+            "description": "Passed in accesstoken associated to the targetusername and instance url.",
+            "required": False
+        },
+        "org": {
+            "description": "Value to replace every instance of the find value in the source file.",
+            "required": False
+        },
+        "dynamic_assigned_to_user": {
+            "description": "If true, query the target org for the default user's Name and replace the placeholder in DRO CSVs (FulfillmentStepDefinition.csv, User.csv, UserAndGroup.csv) so one plan works for both scratch (User User) and TSO (Admin User).",
+            "required": False
+        },
+        "sync_objectset_source_to_source": {
+            "description": "If true, before running SFDMU copy objectset_source/object-set-* into source/object-set-* so object set 2+ use the version-controlled CSVs as source (avoids org-export overwriting desired state for billing etc.).",
+            "required": False
+        },
+        "object_sets": {
+            "description": "Optional list of 0-based object set indices to run (e.g. [0] for Pass 1 only, [1, 2] for Pass 2 and 3). If omitted, all object sets run.",
+            "required": False
+        },
+        "assigned_to_placeholder": {
+            "description": "Placeholder string in DRO CSVs to replace with the target org user's Name. Used when dynamic_assigned_to_user is true.",
+            "required": False
+        },
+        "simulation": {
+            "description": "If true, run SFDMU in simulation mode (dry run without writing to the target org).",
+            "required": False
+        }
+    }
+
+    def _sync_objectset_source_to_source(self) -> None:
+        """Copy objectset_source/object-set-* into source so SFDMU uses version-controlled CSVs.
+        Object set 1: also copy to plan root (base) so Pass 1 uses our composites; copy to source/ with _source suffix.
+        Object sets 2+ use source/object-set-N only.
+        Set 1 must have BillingPolicy (no default treatment) and BillingTreatment so lookups resolve in order.
+        """
+        base = self.pathtoexportjson
+        objectset_source_dir = os.path.join(base, "objectset_source")
+        source_dir = os.path.join(base, "source")
+        if not os.path.isdir(objectset_source_dir):
+            return
+        for name in sorted(os.listdir(objectset_source_dir)):
+            if not name.startswith("object-set-"):
+                continue
+            src_set = os.path.join(objectset_source_dir, name)
+            if not os.path.isdir(src_set):
+                continue
+            # Object set 1 uses source/ (root); sets 2+ use source/object-set-N
+            if name == "object-set-1":
+                dst_set = source_dir
+            else:
+                dst_set = os.path.join(source_dir, name)
+            os.makedirs(dst_set, exist_ok=True)
+            for f in os.listdir(src_set):
+                if not f.endswith(".csv"):
+                    continue
+                src_f = os.path.join(src_set, f)
+                dst_name = f.replace(".csv", "_source.csv") if not f.endswith("_source.csv") else f
+                dst_f = os.path.join(dst_set, dst_name)
+                shutil.copy2(src_f, dst_f)
+                self.logger.info(f"Synced objectset_source -> source: {name}/{f} -> {dst_set}/{dst_name}")
+                # Pass 1 reads object set 1 from plan root (working dir); overwrite root with object-set-1 so composites match.
+                if name == "object-set-1":
+                    root_f = os.path.join(base, f)
+                    shutil.copy2(src_f, root_f)
+                    self.logger.info(f"Synced object-set-1 to plan root: {name}/{f} -> {root_f}")
+                # Some SFDMU versions read object set 2+ by base name (e.g. BillingTreatment.csv); write both base and _source.
+                elif not f.endswith("_source.csv"):
+                    dst_base = os.path.join(dst_set, f)
+                    shutil.copy2(src_f, dst_base)
+                    self.logger.info(f"Synced object-set to source (base name): {name}/{f} -> {dst_base}")
+
+    def _prepare_export_json_file(self) -> None:
+        export_json_path = os.path.join(self.pathtoexportjson, EXPORT_JSON_FILENAME)
+        if not os.path.isdir(self.pathtoexportjson):
+            raise FileNotFoundError(f"Path to export.json is not valid: {self.pathtoexportjson}")
+        if not os.path.isfile(export_json_path):
+            raise FileNotFoundError(f"export.json is missing: {export_json_path}")
+        
+        try:
+            with open(export_json_path, "r") as file:
+                export_json = json.load(file)
+
+            object_sets = self.options.get("object_sets")
+            if object_sets is not None:
+                if isinstance(object_sets, str):
+                    object_sets = json.loads(object_sets)
+                object_sets = [int(i) for i in object_sets]
+                all_sets = export_json.get("objectSets", [])
+                filtered = [all_sets[i] for i in object_sets if 0 <= i < len(all_sets)]
+                if len(filtered) < len(object_sets):
+                    raise TaskOptionsError(
+                        f"object_sets {object_sets} out of range for {len(all_sets)} object sets"
+                    )
+                self._original_object_sets = all_sets
+                export_json["objectSets"] = filtered
+                self.logger.info(f"Running only object sets (0-based): {object_sets}")
+
+            org_data = {
+                'name': self.targetusername,
+                'accessToken': self.accesstoken,
+                'instanceUrl': self.instanceurl
+            }
+            export_json["orgs"] = [org_data]
+
+            with open(export_json_path, "w") as file:
+                json.dump(export_json, file, indent=2)
+
+            self.logger.info(f'Formatted EXPORT.JSON: {json.dumps(export_json, indent=2)}')
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Error parsing export.json: {e}")
+            raise
+        except IOError as e:
+            self.logger.error(f"Error reading/writing export.json: {e}")
+            raise
+
+    def _cleanup_export_json_file(self) -> None:
+        export_json_path = os.path.join(self.pathtoexportjson, EXPORT_JSON_FILENAME)
+        try:
+            with open(export_json_path, "r") as file:
+                export_json = json.load(file)
+
+            export_json["orgs"] = []
+            if getattr(self, "_original_object_sets", None) is not None:
+                export_json["objectSets"] = self._original_object_sets
+
+            with open(export_json_path, "w") as file:
+                json.dump(export_json, file, indent=2)
+        except (json.JSONDecodeError, IOError) as e:
+            self.logger.error(f"Error cleaning up export.json: {e}")
+
+    def _get_target_org_user_name(self) -> str:
+        """Query the target org for the current user's Name (e.g. 'User User' or 'Admin User')."""
+        username = getattr(self.org_config, "username", None) or self.targetusername
+        if not username or "@" not in str(username):
+            raise CommandException(
+                "dynamic_assigned_to_user requires an org with a username (e.g. scratch or connected org). "
+                "Cannot determine user when target is token-only."
+            )
+        # Use username for -o so SF CLI finds the org (CCI org name like 'tfid-cdo' may not be a valid CLI alias)
+        org_for_cli = str(username)
+        escaped = org_for_cli.replace("\\", "\\\\").replace("'", "\\'")
+        query = "SELECT Name FROM User WHERE Username = '%s'" % escaped
+        result = subprocess.run(
+            ["sf", "data", "query", "-q", query, "-o", org_for_cli, "--json"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            self.logger.error(f"sf data query STDERR: {strip_ansi_codes(result.stderr)}")
+            raise CommandException(f"Failed to query User Name: {strip_ansi_codes(result.stderr or result.stdout)}")
+        out = json.loads(result.stdout)
+        records = out.get("result", {}).get("records") or []
+        if not records:
+            raise CommandException("No User record found for target org username.")
+        name = records[0].get("Name")
+        if not name:
+            raise CommandException("User record has no Name.")
+        return name
+
+    def _apply_dynamic_assigned_to_user(self) -> None:
+        """Copy plan to a temp dir and replace DRO assigned-to placeholder with target org user Name."""
+        placeholder = self.options.get("assigned_to_placeholder") or DRO_ASSIGNED_TO_PLACEHOLDER
+        user_name = self._get_target_org_user_name()
+        self.logger.info(f"Replacing DRO assigned-to placeholder with target org user Name: {user_name}")
+        source_dir = self.pathtoexportjson
+        self._temp_plan_dir = tempfile.mkdtemp(prefix="sfdmu_dro_")
+        try:
+            for item in os.listdir(source_dir):
+                src = os.path.join(source_dir, item)
+                dst = os.path.join(self._temp_plan_dir, item)
+                if os.path.isdir(src):
+                    shutil.copytree(src, dst)
+                else:
+                    shutil.copy2(src, dst)
+            for filename in DRO_CSV_FILES_TO_REPLACE:
+                path = os.path.join(self._temp_plan_dir, filename)
+                if not os.path.isfile(path):
+                    continue
+                with open(path, "r", encoding="utf-8", newline="") as f:
+                    content = f.read()
+                if placeholder not in content:
+                    continue
+                with open(path, "w", encoding="utf-8", newline="") as f:
+                    f.write(content.replace(placeholder, user_name))
+                self.logger.info(f"Replaced placeholder in {filename}")
+            self.pathtoexportjson = self._temp_plan_dir
+        except Exception:
+            if getattr(self, "_temp_plan_dir", None) and os.path.isdir(self._temp_plan_dir):
+                shutil.rmtree(self._temp_plan_dir, ignore_errors=True)
+            raise
+
+    def _set_project_defaults(self, instanceurl: str) -> None:
+        try:
+            subprocess.run(["sf", "config set", f"instanceUrl={instanceurl}"], 
+                           check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"Error setting project defaults: {e}")
+            raise CommandException(f"Error setting project defaults: {e}")
+
+    def _init_options(self, kwargs: Dict[str, Any]) -> None:
+        super(LoadSFDMUData, self)._init_options(kwargs)
+        self.env = self._get_env()
+        self.keychain: Optional[BaseProjectKeychain] = None
+
+    @property
+    def keychain_cls(self):
+        return self.get_keychain_class() or self.keychain_class
+
+    @abstractmethod
+    def get_keychain_class(self):
+        return None
+
+    @property
+    def keychain_key(self):
+        return self.get_keychain_key()
+
+    @abstractmethod
+    def get_keychain_key(self):
+        return None
+    
+    def _load_keychain(self) -> None:
+        if self.keychain is not None:
+            return
+
+        keychain_key = self.keychain_key if self.keychain_cls.encrypted else None
+
+        if self.project_config is None:
+            self.keychain = self.keychain_cls(self.universal_config, keychain_key)
+        else:
+            self.keychain = self.keychain_cls(self.project_config, keychain_key)
+            self.project_config.keychain = self.keychain
+
+    def _prep_runtime(self) -> None:
+        if "org" not in self.options or not self.options["org"]:
+            self._load_keychain()
+        
+        self.pathtoexportjson = self.options.get("pathtoexportjson", "datasets/sfdmu/")
+        self._temp_plan_dir = None
+
+        if isinstance(self.org_config, ScratchOrgConfig):
+            self.targetusername = self.org_config.username
+        else:
+            self.targetusername = self.options.get("targetusername") or self.org_config.access_token
+
+        self.accesstoken = self.options.get("accesstoken") or self.org_config.access_token
+        self.instanceurl = self.options.get("instanceurl") or self.org_config.instance_url
+
+        if self.options.get("dynamic_assigned_to_user"):
+            self._apply_dynamic_assigned_to_user()
+        if self.options.get("sync_objectset_source_to_source"):
+            self._sync_objectset_source_to_source()
+        self._prepare_export_json_file()
+    
+    def _run_task(self) -> None:
+        try:
+            self._prep_runtime()
+            
+            self.logger.info(f'Target Path: {self.pathtoexportjson}')
+            self.logger.info(f'Current Working Directory: {self.options.get("dir")}')
+            
+            cmd = self._get_command()
+            self.logger.info(f'Executing command: {cmd}')  # Log the command being executed
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=self.options.get("dir"))
+            
+            if result.returncode != 0:
+                self.logger.error(f"Command failed with exit code {result.returncode}")
+                self.logger.error(f"STDOUT: {strip_ansi_codes(result.stdout)}")
+                self.logger.error(f"STDERR: {strip_ansi_codes(result.stderr)}")
+                raise CommandException(f"Command failed with exit code {result.returncode}")
+
+            for line in result.stdout.splitlines():
+                self.logger.info(strip_ansi_codes(line))
+            
+        except Exception as e:
+            self.logger.error(f"An error occurred: {str(e)}")
+            raise
+        finally:
+            self.logger.info('Cleaning up export.json...')
+            self._cleanup_export_json_file()
+            if getattr(self, "_temp_plan_dir", None) and os.path.isdir(self._temp_plan_dir):
+                shutil.rmtree(self._temp_plan_dir, ignore_errors=True)
+                self.logger.info("Removed temp plan directory.")
+    def _get_command(self) -> str:
+        trimmed_instance_url = self._trim_instance_url(self.instanceurl)
+        if not isinstance(self.org_config, ScratchOrgConfig):
+            cmd = LOAD_COMMAND.format(
+                targetusername=self.targetusername,
+                pathtoexportjson=self.pathtoexportjson,
+                instanceurl=trimmed_instance_url
+            )
+        else:
+            cmd = SCRATCHORG_LOAD_COMMAND.format(
+                targetusername=self.targetusername,
+                pathtoexportjson=self.pathtoexportjson,
+                instanceurl=trimmed_instance_url
+            )
+        if self.options.get("simulation"):
+            cmd += " --simulation"
+        return cmd
+        
+    def _trim_instance_url(self, url: str) -> str:
+        return url.replace("https://", "").replace("http://", "")
+
+
+def _sobjects_from_export_json(export_path: str) -> list:
+    """Parse export.json and return list of sobject API names (excluding excluded objects).
+
+    Uses the same exclusive logic as parse_plan_structure in post_process_extraction.py:
+    objectSets if present, otherwise top-level objects (single virtual set).
+    """
+    path = os.path.join(export_path, EXPORT_JSON_FILENAME)
+    with open(path, "r") as f:
+        data = json.load(f)
+    sobjects = []
+    object_sets = data.get("objectSets", [])
+    if not object_sets and "objects" in data:
+        object_sets = [{"objects": data["objects"]}]
+    for obj_set in object_sets:
+        for obj in obj_set.get("objects", []):
+            if obj.get("excluded"):
+                continue
+            q = obj.get("query", "")
+            m = re.search(r"\s+FROM\s+(\w+)(?:\s|$)", q, re.IGNORECASE)
+            if m:
+                name = m.group(1)
+                if name not in sobjects:
+                    sobjects.append(name)
+    return sobjects
+
+
+class DeleteSFDMUData(BaseSalesforceTask):
+    """Delete all records for Insert-operation objects defined in an SFDMU plan.
+
+    Reads the plan's export.json, identifies all non-excluded objects with
+    operation=Insert (in array order), and deletes ALL records of those types
+    in REVERSE array order — children first, matching SFDMU's deleteOldData
+    deletion sequence.
+
+    Shape-agnostic: no WHERE-clause filtering is applied. The full type is
+    cleared regardless of which data shape populated it. The plan file is the
+    authoritative definition of which object types are managed.
+
+    Intended as the cleanup step before running LoadSFDMUData on a plan that
+    uses operation=Insert (without deleteOldData) to support layered data
+    shapes: run DeleteSFDMUData once, then run each layered plan in sequence.
+    """
+
+    keychain_class = BaseProjectKeychain
+    task_options: Dict[str, Dict[str, Any]] = {
+        "pathtoexportjson": {
+            "description": (
+                "Directory path to the SFDMU plan (same value used by LoadSFDMUData). "
+                "export.json is read from this directory to determine which object types "
+                "to delete."
+            ),
+            "required": True,
+        },
+        "api_version": {
+            "description": "Salesforce API version override (e.g. '67.0'). Defaults to org or project version.",
+            "required": False,
+        },
+        "object_sets": {
+            "description": (
+                "Optional list of 0-based object set indices to include "
+                "(e.g. [0] for the first objectSet only). Omit to process all objectSets."
+            ),
+            "required": False,
+        },
+    }
+
+    _BATCH_SIZE = 200  # REST composite sobjects delete limit
+
+    @property
+    def _access_token(self) -> str:
+        return self.org_config.access_token
+
+    @property
+    def _instance_url(self) -> str:
+        return self.org_config.instance_url.rstrip("/")
+
+    @property
+    def _api_version(self) -> str:
+        if self.options.get("api_version"):
+            return str(self.options["api_version"])
+        return (
+            getattr(self.org_config, "api_version", None)
+            or getattr(self.project_config, "project__package__api_version", "67.0")
+        )
+
+    @property
+    def _auth_headers(self) -> Dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self._access_token}",
+            "Content-Type": "application/json",
+        }
+
+    def _run_task(self) -> None:
+        plan_dir = self.options.get("pathtoexportjson", "datasets/sfdmu/")
+        export_json_path = os.path.join(plan_dir, EXPORT_JSON_FILENAME)
+
+        with open(export_json_path) as f:
+            plan = json.load(f)
+
+        object_sets = plan.get("objectSets", [])
+        if not object_sets and "objects" in plan:
+            object_sets = [{"objects": plan["objects"]}]
+
+        selected = self.options.get("object_sets")
+        if selected is not None:
+            if isinstance(selected, str):
+                selected = json.loads(selected)
+            selected = [int(i) for i in selected]
+            object_sets = [object_sets[i] for i in selected if 0 <= i < len(object_sets)]
+
+        # Collect Insert-operation objects in plan array order.
+        # Duplicates are preserved so that the deletion order mirrors the plan exactly.
+        insert_sobjects: List[str] = []
+        for obj_set in object_sets:
+            for obj in obj_set.get("objects", []):
+                if obj.get("excluded", False):
+                    continue
+                if obj.get("operation", "").lower() != "insert":
+                    continue
+                m = re.search(r"\s+FROM\s+(\w+)(?:\s|$)", obj.get("query", ""), re.IGNORECASE)
+                if m:
+                    insert_sobjects.append(m.group(1))
+
+        if not insert_sobjects:
+            self.logger.info("No Insert-operation objects found in plan. Nothing to delete.")
+            return
+
+        # Reverse = children first, matching SFDMU's deleteOldData sequence.
+        deletion_order = list(reversed(insert_sobjects))
+        self.logger.info(
+            f"Deleting {len(deletion_order)} Insert-operation object type(s) "
+            f"in reverse plan order:"
+        )
+        for i, name in enumerate(deletion_order, 1):
+            self.logger.info(f"  {i}. {name}")
+
+        total_deleted = 0
+        for sobject_name in deletion_order:
+            total_deleted += self._delete_all_records(sobject_name)
+
+        self.logger.info(f"Done. Total records deleted: {total_deleted}")
+
+    def _delete_all_records(self, sobject_name: str) -> int:
+        """Query all records of sobject_name and delete via REST composite endpoint.
+
+        Uses allOrNone=false for partial-success semantics: individual failures
+        are logged as errors but do not abort deletion of remaining records.
+        Returns the count of successfully deleted records.
+        """
+        query_url = f"{self._instance_url}/services/data/v{self._api_version}/query"
+        records: List[dict] = []
+        url = query_url
+        params: Optional[Dict] = {"q": f"SELECT Id FROM {sobject_name}"}
+
+        while True:
+            resp = requests.get(url, headers=self._auth_headers, params=params)
+            if resp.status_code != 200:
+                self.logger.error(
+                    f"{sobject_name}: SOQL query failed ({resp.status_code}): {resp.text}"
+                )
+                return 0
+            body = resp.json()
+            records.extend(body.get("records", []))
+            next_url = body.get("nextRecordsUrl")
+            if body.get("done", False) or not next_url:
+                break
+            url = f"{self._instance_url}{next_url}"
+            params = None
+
+        count = len(records)
+        if count == 0:
+            self.logger.info(f"{sobject_name}: 0 records found. Skipping.")
+            return 0
+
+        self.logger.info(f"{sobject_name}: Deleting {count} record(s)...")
+
+        ids = [r["Id"] for r in records]
+        delete_url = (
+            f"{self._instance_url}/services/data/v{self._api_version}/composite/sobjects"
+        )
+        deleted = 0
+        failed = 0
+
+        for i in range(0, len(ids), self._BATCH_SIZE):
+            batch = ids[i : i + self._BATCH_SIZE]
+            resp = requests.delete(
+                delete_url,
+                headers=self._auth_headers,
+                params={"ids": ",".join(batch), "allOrNone": "false"},
+            )
+            if resp.status_code != 200:
+                self.logger.error(
+                    f"{sobject_name}: Batch delete failed ({resp.status_code}): {resp.text}"
+                )
+                failed += len(batch)
+                continue
+
+            for result in resp.json():
+                if result.get("success"):
+                    deleted += 1
+                else:
+                    failed += 1
+                    for err in result.get("errors", []):
+                        self.logger.error(
+                            f"{sobject_name}: Failed to delete {result.get('id', '?')}: "
+                            f"{err.get('message', err)}"
+                        )
+
+        suffix = f" ({failed} failed)" if failed else ""
+        self.logger.info(f"{sobject_name}: Deleted {deleted}/{count}{suffix}")
+        return deleted
+
+
+class TestSFDMUIdempotency(SFDXBaseTask):
+    """Run an SFDMU load twice and assert record counts do not increase (idempotency).
+
+    Use this to verify that a data plan uses SFDMU v5 composite key notation correctly:
+    objects with multi-component externalIds must have a $$ column in the CSV so the
+    second run matches existing records instead of inserting duplicates.
+    """
+
+    keychain_class = BaseProjectKeychain
+    task_options: Dict[str, Dict[str, Any]] = {
+        "pathtoexportjson": {"description": "Directory path to the export.json (same as the load task)", "required": True},
+        "targetusername": {"description": "Target org username or alias", "required": False},
+        "instanceurl": {"description": "Instance URL for the target org", "required": False},
+        "accesstoken": {"description": "Access token for the target org", "required": False},
+        "org": {"description": "Org name (for keychain resolution)", "required": False},
+        "use_extraction_roundtrip": {
+            "description": "If true, second load uses extract -> post_process -> load from processed dir (validates v5 re-import from extracted data)",
+            "required": False,
+        },
+        "persist_extraction_output": {
+            "description": (
+                "If true and use_extraction_roundtrip is true, write extraction and processed "
+                "output to a persistent directory derived from the plan directory, rather than "
+                "a temp dir. The base path is computed by going two levels up from the plan "
+                "directory's parent, then appending extractions/<plan>/<timestamp>/. For the "
+                "standard layout (<root>/<dataset>/<locale>/<plan>), this places output at "
+                "<root>/extractions/<plan>/<timestamp>/ (e.g. "
+                "datasets/sfdmu/extractions/qb-rating/2026-03-02T120000/). "
+                "Omit or false to use a temp dir only."
+            ),
+            "required": False,
+        },
+        "run_after_each_load_apex": {
+            "description": (
+                "Optional path to an Apex script to run after each load, for deduplication only. "
+                "The script MUST NOT activate PUR, PUG, or any other records. Plans using "
+                "deleteOldData require all records to remain in Draft state between loads: "
+                "activating after the first load causes the second SFDMU run to fail because "
+                "Salesforce rejects REST DELETE of Active records, doubling counts instead of "
+                "replacing them. Example use: a script that removes duplicate Draft PURs created "
+                "by a re-run before counts are compared."
+            ),
+            "required": False,
+        },
+    }
+
+    def _init_options(self, kwargs: Dict[str, Any]) -> None:
+        super(TestSFDMUIdempotency, self)._init_options(kwargs)
+        self.env = self._get_env()
+        self.keychain: Optional[BaseProjectKeychain] = None
+
+    @property
+    def keychain_cls(self):
+        return self.get_keychain_class() or self.keychain_class
+
+    def get_keychain_class(self):
+        return None
+
+    @property
+    def keychain_key(self):
+        return self.get_keychain_key()
+
+    def get_keychain_key(self):
+        return None
+
+    def _load_keychain(self) -> None:
+        if self.keychain is not None:
+            return
+        keychain_key = self.keychain_key if self.keychain_cls.encrypted else None
+        if self.project_config is None:
+            self.keychain = self.keychain_cls(self.universal_config, keychain_key)
+        else:
+            self.keychain = self.keychain_cls(self.project_config, keychain_key)
+            self.project_config.keychain = self.keychain
+
+    def _get_org_for_cli(self) -> str:
+        if isinstance(self.org_config, ScratchOrgConfig):
+            return self.org_config.username
+        # CLI commands (sf apex run, sf data query) require an authorized org alias or username
+        # as --target-org. Never fall back to access_token: it fails CLI auth and leaks a
+        # secret via logs, shell history, and process listings. The access_token is kept
+        # exclusively in the export.json orgs block where SFDMU needs it.
+        org_alias = self.options.get("targetusername") or getattr(self.org_config, "username", None)
+        if not org_alias:
+            raise TaskOptionsError(
+                "No target username/alias available for Salesforce CLI invocation. "
+                "Provide a valid 'targetusername' option or ensure org_config.username is set. "
+                "Falling back to org_config.access_token is not supported for CLI calls."
+            )
+        return org_alias
+
+    def _get_record_counts(self, sobjects: list) -> Dict[str, int]:
+        org_alias = self._get_org_for_cli()
+        counts = {}
+        for sobject in sobjects:
+            try:
+                result = subprocess.run(
+                    ["sf", "data", "query", "-q", f"SELECT COUNT(Id) cnt FROM {sobject}", "-o", org_alias, "--json"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    cwd=self.options.get("dir"),
+                )
+            except subprocess.TimeoutExpired:
+                self.logger.warning(f"Timeout querying {sobject}, skipping")
+                continue
+            if result.returncode != 0:
+                self.logger.warning(f"Query {sobject} failed: {strip_ansi_codes(result.stderr or result.stdout)}, skipping")
+                continue
+            try:
+                out = json.loads(result.stdout)
+                records = out.get("result", {}).get("records") or []
+                if records and "cnt" in records[0]:
+                    counts[sobject] = int(records[0]["cnt"])
+                else:
+                    counts[sobject] = 0
+            except (json.JSONDecodeError, KeyError, IndexError):
+                self.logger.warning(f"Could not parse count for {sobject}, skipping")
+        return counts
+
+    def _run_load_once(self, plan_dir: Optional[str] = None) -> None:
+        plan_dir = plan_dir or self.options.get("pathtoexportjson", "datasets/sfdmu/")
+        export_path = os.path.join(plan_dir, EXPORT_JSON_FILENAME)
+        if not os.path.isfile(export_path):
+            raise FileNotFoundError(f"export.json not found: {export_path}")
+        with open(export_path, "r") as f:
+            export_json = json.load(f)
+        org_data = {"name": self._get_org_for_cli(), "accessToken": self.accesstoken, "instanceUrl": self.instanceurl}
+        export_json["orgs"] = [org_data]
+        with open(export_path, "w") as f:
+            json.dump(export_json, f, indent=2)
+        trimmed = self.instanceurl.replace("https://", "").replace("http://", "")
+        cmd = f"sf sfdmu run --sourceusername CSVFILE --targetusername {self._get_org_for_cli()} -p {plan_dir} --canmodify {trimmed} --noprompt --verbose"
+        self.logger.info(f"Running SFDMU: {cmd}")
+        result = None
+        try:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, cwd=self.options.get("dir")
+            )
+            if result.returncode != 0:
+                self.logger.error(strip_ansi_codes(result.stdout))
+                self.logger.error(strip_ansi_codes(result.stderr))
+                raise CommandException(f"SFDMU load failed with exit code {result.returncode}")
+            for line in result.stdout.splitlines():
+                self.logger.info(strip_ansi_codes(line))
+        finally:
+            # Always clear injected org credentials from export.json
+            export_json["orgs"] = []
+            with open(export_path, "w") as f:
+                json.dump(export_json, f, indent=2)
+
+    def _run_extract_once(self, work_dir: str) -> None:
+        """Extract from org into work_dir (must contain export.json with orgs injected)."""
+        cmd = EXTRACT_COMMAND.format(sourceusername=self._get_org_for_cli(), pathtoexportjson=work_dir)
+        self.logger.info(f"Running SFDMU extract: {cmd}")
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, cwd=self.options.get("dir"),
+        )
+        if result.returncode != 0:
+            self.logger.error(strip_ansi_codes(result.stdout))
+            self.logger.error(strip_ansi_codes(result.stderr))
+            raise CommandException(f"SFDMU extract failed with exit code {result.returncode}")
+        for line in result.stdout.splitlines():
+            self.logger.info(strip_ansi_codes(line))
+
+    def _run_post_load_apex_if_configured(self) -> None:
+        """If run_after_each_load_apex is set, run that Apex script against the target org for deduplication only (must not activate records)."""
+        apex_path = self.options.get("run_after_each_load_apex")
+        if not apex_path:
+            return
+        base = self.options.get("dir") or os.getcwd()
+        path = os.path.join(base, apex_path) if not os.path.isabs(apex_path) else apex_path
+        if not os.path.isfile(path):
+            raise TaskOptionsError(
+                f"Configured run_after_each_load_apex path does not exist: {path}. "
+                "Fix the path or remove the option. Silently skipping would produce "
+                "misleading test results."
+            )
+        org = self._get_org_for_cli()
+        cmd = ["sf", "apex", "run", "--target-org", org, "--file", path]
+        self.logger.info(f"Running post-load Apex: {' '.join(cmd)}")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, cwd=base, timeout=300)
+        except subprocess.TimeoutExpired as e:
+            self.logger.error(f"Post-load Apex timed out after 300s: {path}")
+            if e.stdout:
+                stdout_text = e.stdout.decode() if isinstance(e.stdout, bytes) else e.stdout
+                self.logger.error(strip_ansi_codes(stdout_text))
+            if e.stderr:
+                stderr_text = e.stderr.decode() if isinstance(e.stderr, bytes) else e.stderr
+                self.logger.error(strip_ansi_codes(stderr_text))
+            raise CommandException(f"Post-load Apex timed out after 300s: {path}") from e
+        if result.returncode != 0:
+            self.logger.error(strip_ansi_codes(result.stdout or ""))
+            self.logger.error(strip_ansi_codes(result.stderr or ""))
+            raise CommandException(f"Post-load Apex failed with exit code {result.returncode}")
+        for line in (result.stdout or "").splitlines():
+            self.logger.info(strip_ansi_codes(line))
+
+    def _run_task(self) -> None:
+        if "org" not in self.options or not self.options["org"]:
+            self._load_keychain()
+        plan_dir = self.options.get("pathtoexportjson", "datasets/sfdmu/")
+        if not os.path.isdir(plan_dir):
+            raise FileNotFoundError(f"Plan directory not found: {plan_dir}")
+        if isinstance(self.org_config, ScratchOrgConfig):
+            self.targetusername = self.org_config.username
+        else:
+            self.targetusername = self.options.get("targetusername") or getattr(self.org_config, "username", None)
+        self.accesstoken = self.options.get("accesstoken") or self.org_config.access_token
+        self.instanceurl = self.options.get("instanceurl") or self.org_config.instance_url
+        org_identifier = self.options.get("org") or getattr(self.org_config, "name", None) or self._get_org_for_cli()
+        self.logger.info(f"Using org for source and target: {org_identifier}")
+        sobjects = _sobjects_from_export_json(plan_dir)
+        if not sobjects:
+            raise TaskOptionsError("No sobjects found in export.json")
+        self.logger.info("First run: load data into org")
+        self._run_load_once()
+        self._run_post_load_apex_if_configured()
+        counts_after_first = self._get_record_counts(sobjects)
+        use_roundtrip = str(self.options.get("use_extraction_roundtrip", "")).lower() in {"1", "true", "yes"}
+        if use_roundtrip:
+            self.logger.info("Extraction roundtrip: extract -> post-process -> load from processed (validates v5 re-import)")
+            persist_output = str(self.options.get("persist_extraction_output", "")).lower() in {"1", "true", "yes"}
+            if persist_output:
+                from datetime import datetime
+                plan_name = os.path.basename(os.path.normpath(plan_dir))
+                # Path calculation: dirname(plan_dir) goes up to the locale dir (e.g. en-US),
+                # then two ".." steps reach the sfdmu root (e.g. datasets/sfdmu), then
+                # "extractions/<plan>" is appended. Example for qb-rating:
+                #   plan_dir=datasets/sfdmu/qb/en-US/qb-rating
+                #   dirname → datasets/sfdmu/qb/en-US
+                #   + ../.. → datasets/sfdmu   (each ".." resolves one level: en-US→qb, qb→sfdmu)
+                #   + extractions/qb-rating → datasets/sfdmu/extractions/qb-rating
+                # Note: three ".." would overshoot to datasets/extractions/qb-rating (verified).
+                base = os.path.normpath(os.path.join(os.path.dirname(plan_dir), "..", "..", "extractions", plan_name))
+                timestamp = datetime.now().strftime("%Y-%m-%dT%H%M%S")
+                work_dir = os.path.join(base, timestamp)
+                os.makedirs(work_dir, exist_ok=True)
+                self.logger.info(f"Writing extraction and processed output to: {work_dir}")
+                use_temp = False
+            else:
+                work_dir = tempfile.mkdtemp(prefix="sfdmu_idem_extract_")
+                use_temp = True
+            try:
+                export_src = os.path.join(plan_dir, EXPORT_JSON_FILENAME)
+                export_dst = os.path.join(work_dir, EXPORT_JSON_FILENAME)
+                shutil.copy2(export_src, export_dst)
+                with open(export_dst, "r") as f:
+                    export_json = json.load(f)
+                export_json["orgs"] = [{"name": self._get_org_for_cli(), "accessToken": self.accesstoken, "instanceUrl": self.instanceurl}]
+                with open(export_dst, "w") as f:
+                    json.dump(export_json, f, indent=2)
+                self._run_extract_once(work_dir)
+                # Scrub credentials immediately so they are not left on disk if we crash before finally
+                export_in_work = os.path.join(work_dir, EXPORT_JSON_FILENAME)
+                if os.path.isfile(export_in_work):
+                    try:
+                        with open(export_in_work, "r") as f:
+                            ej = json.load(f)
+                        ej["orgs"] = []
+                        with open(export_in_work, "w") as f:
+                            json.dump(ej, f, indent=2)
+                    except Exception as e:
+                        self.logger.warning(f"Could not clear credentials from {export_in_work}: {e}")
+                processed_dir = os.path.join(work_dir, "processed")
+                os.makedirs(processed_dir, exist_ok=True)
+                run_post_process_script(
+                    work_dir, plan_dir, processed_dir,
+                    cwd=self.options.get("dir"), logger=self.logger,
+                )
+                shutil.copy2(export_src, os.path.join(processed_dir, EXPORT_JSON_FILENAME))
+                self.logger.info("Second run: load from post-processed extraction (should not add records)")
+                self._run_load_once(processed_dir)
+                self._run_post_load_apex_if_configured()
+            finally:
+                # Always clear credentials from work_dir/export.json (persist mode leaves dir on disk)
+                if work_dir and os.path.isdir(work_dir):
+                    export_in_work = os.path.join(work_dir, EXPORT_JSON_FILENAME)
+                    if os.path.isfile(export_in_work):
+                        try:
+                            with open(export_in_work, "r") as f:
+                                ej = json.load(f)
+                            ej["orgs"] = []
+                            with open(export_in_work, "w") as f:
+                                json.dump(ej, f, indent=2)
+                        except Exception as e:
+                            self.logger.warning(f"Could not clear credentials from {export_in_work}: {e}")
+                    if use_temp:
+                        shutil.rmtree(work_dir, ignore_errors=True)
+                        self.logger.info("Removed extraction roundtrip temp directory.")
+        else:
+            self.logger.info("Second run: idempotent re-run from source (should not add records)")
+            self._run_load_once()
+            self._run_post_load_apex_if_configured()
+        counts_after_second = self._get_record_counts(sobjects)
+        failures = []
+        for sobject in sobjects:
+            c1 = counts_after_first.get(sobject, 0)
+            c2 = counts_after_second.get(sobject, 0)
+            if c2 > c1:
+                failures.append(f"{sobject}: count increased from {c1} to {c2} (not idempotent)")
+            else:
+                self.logger.info(f"  {sobject}: {c1} -> {c2} (ok)")
+        if failures:
+            self.logger.error("Idempotency check failed:")
+            for msg in failures:
+                self.logger.error(f"  {msg}")
+            raise CommandException("Re-run added records. Ensure composite-key objects have a $$ column in the CSV (SFDMU v5).")
+        self.logger.info("Idempotency check passed: no record count increase on second run.")
+
+
+class ExtractSFDMUData(SFDXBaseTask):
+    """Extract data from a Salesforce org into CSV files using SFDMU.
+
+    Uses the same export.json as LoadSFDMUData but reverses the direction:
+    the org becomes the source and CSVFILE becomes the target.  SFDMU writes
+    one CSV per queried object into the plan directory (or a separate output
+    directory when ``output_dir`` is specified).
+
+    Relationship traversal fields in the SOQL queries (e.g.
+    Product.StockKeepingUnit) are resolved during extraction, producing
+    portable CSVs with human-readable names/codes instead of raw Salesforce
+    Ids.
+    """
+
+    keychain_class = BaseProjectKeychain
+    task_options: Dict[str, Dict[str, Any]] = {
+        "pathtoexportjson": {
+            "description": "Directory path containing the export.json to use for extraction",
+            "required": True
+        },
+        "sourceusername": {
+            "description": "Username or alias of the org to extract from.  Defaults to the current CCI org.",
+            "required": False
+        },
+        "output_dir": {
+            "description": (
+                "Directory where extracted CSVs will be written.  "
+                "If omitted, SFDMU writes CSVs into the plan directory itself.  "
+                "When set, the export.json is copied to a temp working directory "
+                "and SFDMU writes its output there, then CSVs are moved to output_dir."
+            ),
+            "required": False
+        },
+        "object_sets": {
+            "description": "Optional list of 0-based object set indices to extract (e.g. [0] for Pass 1 only).  If omitted, all object sets are extracted.",
+            "required": False
+        },
+        "run_post_process": {
+            "description": "If True (default), run post_process_extraction.py after extraction so output is re-import-ready (adds $$ composite key columns, normalizes headers). Processed CSVs are written to <output_dir>/processed/.",
+            "required": False
+        },
+        "extractions_base_dir": {
+            "description": (
+                "Base directory under which extracted CSVs are written as "
+                "<extractions_base_dir>/<plan_name>/<timestamp>/. "
+                "Overrides the default two-level-up calculation. "
+                "Use this when the plan directory is not 4 levels deep relative to the repo root."
+            ),
+            "required": False
+        },
+        "referenceplandir": {
+            "description": (
+                "Directory of a reference plan whose CSV column schema the processed "
+                "output should be aligned to (the 'golden' format, e.g. the qb sibling "
+                "of a q3/mfg/ja variant). Makes a freshly-extracted variant plan UNIFORM "
+                "with qb instead of inheriting its own (possibly stale) CSV schema. "
+                "If omitted, the qb/en-US sibling is auto-derived from the plan path when "
+                "it exists and differs from the plan; pass 'none' to disable alignment and "
+                "use the plan's own CSV schema."
+            ),
+            "required": False
+        },
+        "copy_to_plan": {
+            "description": (
+                "If true, write the processed extraction back into the plan directory as its "
+                "tracked CSV set (processed plan objects + cleaned incidental CSVs + header-only "
+                "placeholders for 0-record objects, uniform with the reference plan), completing "
+                "the extract->plan-dir loop in one command. Non-destructive: plan CSVs outside the "
+                "reference set are left in place and reported. Default false (writes only to "
+                "<output_dir>/processed/)."
+            ),
+            "required": False
+        }
+    }
+
+    def _init_options(self, kwargs: Dict[str, Any]) -> None:
+        super(ExtractSFDMUData, self)._init_options(kwargs)
+        self.env = self._get_env()
+        self.keychain: Optional[BaseProjectKeychain] = None
+
+    @property
+    def keychain_cls(self):
+        return self.get_keychain_class() or self.keychain_class
+
+    @abstractmethod
+    def get_keychain_class(self):
+        return None
+
+    @property
+    def keychain_key(self):
+        return self.get_keychain_key()
+
+    @abstractmethod
+    def get_keychain_key(self):
+        return None
+
+    def _load_keychain(self) -> None:
+        if self.keychain is not None:
+            return
+        keychain_key = self.keychain_key if self.keychain_cls.encrypted else None
+        if self.project_config is None:
+            self.keychain = self.keychain_cls(self.universal_config, keychain_key)
+        else:
+            self.keychain = self.keychain_cls(self.project_config, keychain_key)
+            self.project_config.keychain = self.keychain
+
+    def _prepare_working_dir(self) -> str:
+        """Create a temporary working directory with a copy of the export.json.
+
+        SFDMU writes extracted CSVs into the directory that contains
+        export.json.  To avoid clobbering the version-controlled plan CSVs we
+        copy only the export.json to a temp dir and point SFDMU there.
+        """
+        plan_dir = self.options.get("pathtoexportjson", "datasets/sfdmu/")
+        export_json_path = os.path.join(plan_dir, EXPORT_JSON_FILENAME)
+        if not os.path.isfile(export_json_path):
+            raise FileNotFoundError(f"export.json not found: {export_json_path}")
+
+        work_dir = tempfile.mkdtemp(prefix="sfdmu_extract_")
+        shutil.copy2(export_json_path, os.path.join(work_dir, EXPORT_JSON_FILENAME))
+        self.logger.info(f"Created extraction working directory: {work_dir}")
+        return work_dir
+
+    def _prepare_export_json(self, work_dir: str) -> None:
+        """Inject org credentials and optional object_sets filter."""
+        export_json_path = os.path.join(work_dir, EXPORT_JSON_FILENAME)
+        with open(export_json_path, "r") as f:
+            export_json = json.load(f)
+
+        object_sets = self.options.get("object_sets")
+        if object_sets is not None:
+            if isinstance(object_sets, str):
+                object_sets = json.loads(object_sets)
+            object_sets = [int(i) for i in object_sets]
+            all_sets = export_json.get("objectSets", [])
+            filtered = [all_sets[i] for i in object_sets if 0 <= i < len(all_sets)]
+            if len(filtered) < len(object_sets):
+                raise TaskOptionsError(
+                    f"object_sets {object_sets} out of range for {len(all_sets)} object sets"
+                )
+            export_json["objectSets"] = filtered
+            self.logger.info(f"Extracting only object sets (0-based): {object_sets}")
+
+        # For extraction the source is the org; inject auth so SFDMU can connect
+        org_data = {
+            "name": self.sourceusername,
+            "accessToken": self.accesstoken,
+            "instanceUrl": self.instanceurl,
+        }
+        export_json["orgs"] = [org_data]
+
+        with open(export_json_path, "w") as f:
+            json.dump(export_json, f, indent=2)
+
+        self.logger.info(f"Prepared export.json for extraction in {work_dir}")
+
+    def _collect_output(self, work_dir: str) -> str:
+        """Move extracted CSVs from work_dir to the output_dir (or plan dir).
+
+        Returns the final output directory path.
+        """
+        output_dir = self.options.get("output_dir")
+        plan_dir = self.options.get("pathtoexportjson", "datasets/sfdmu/")
+        if not output_dir:
+            # Default: timestamped subdirectory under <extractions_base_dir>/<plan_name>/
+            plan_name = os.path.basename(os.path.normpath(plan_dir))
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y-%m-%dT%H%M%S")
+            extractions_base_dir = self.options.get("extractions_base_dir")
+            if extractions_base_dir:
+                base = extractions_base_dir
+            else:
+                base = os.path.join(os.path.dirname(plan_dir), "..", "..", "extractions")
+            output_dir = os.path.join(base, plan_name, timestamp)
+            output_dir = os.path.normpath(output_dir)
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        csv_count = 0
+        for fname in os.listdir(work_dir):
+            if fname.endswith(".csv"):
+                src = os.path.join(work_dir, fname)
+                dst = os.path.join(output_dir, fname)
+                shutil.move(src, dst)
+                csv_count += 1
+                self.logger.info(f"  {fname}")
+
+        self.logger.info(f"Collected {csv_count} CSV files to {output_dir}")
+        return output_dir
+
+    def _cli_org(self) -> Optional[str]:
+        """CLI-safe org identifier for `sf` commands (alias or username).
+
+        The SFDMU extract may use the access_token (SFDMU keeps it in the orgs block),
+        so ``self.sourceusername`` can be an access_token for a non-scratch org with no
+        explicit sourceusername. ``sf data query --target-org`` requires a locally
+        authorized alias/username and rejects a bearer token (failing CLI auth and
+        leaking the secret), so resolve a real alias/username here: the explicit
+        sourceusername option, else org_config.username. Never the access_token.
+        """
+        return self.options.get("sourceusername") or getattr(self.org_config, "username", None)
+
+    def _sf_query_records(self, soql: str) -> List[dict]:
+        """Run a read-only SOQL query against the source org and return records.
+
+        Returns [] on any error (the backfill is best-effort: a failed map query
+        simply leaves the affected code components blank, the prior behaviour).
+        """
+        org = self._cli_org()
+        if not org:
+            self.logger.warning("No CLI-safe org alias/username for code-map query; skipping backfill")
+            return []
+        cmd = ["sf", "data", "query", "--target-org", org, "-q", soql, "--json"]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True)
+        except Exception as e:  # pragma: no cover - subprocess failure
+            self.logger.warning(f"Code-map query error: {e}")
+            return []
+        if res.returncode != 0:
+            self.logger.warning(
+                f"Code-map query failed ({soql}): {strip_ansi_codes((res.stderr or '')[:200])}"
+            )
+            return []
+        try:
+            return json.loads(res.stdout).get("result", {}).get("records", []) or []
+        except (ValueError, AttributeError) as e:
+            self.logger.warning(f"Code-map parse failed: {e}")
+            return []
+
+    def _extracted_column_all_blank(self, output_dir: str, objname: str, col: str) -> bool:
+        """True iff the extracted CSV for objname has column col present with rows,
+        and every value is empty or SFDMU's #N/A null marker (i.e. needs backfill)."""
+        path = os.path.join(output_dir, f"{objname}.csv")
+        if not os.path.isfile(path):
+            return False
+        import csv as _csv
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            reader = _csv.reader(f)
+            header = next(reader, None)
+            if not header:
+                return False
+            header = [h.strip().lstrip("﻿").strip().strip('"') for h in header]
+            if col not in header:
+                return False
+            ci = header.index(col)
+            saw_row = False
+            for row in reader:
+                saw_row = True
+                val = row[ci] if ci < len(row) else ""
+                if val not in ("", "#N/A"):
+                    return False
+            return saw_row
+
+    def _build_code_backfill_map(self, plan_dir: str, output_dir: str) -> dict:
+        """Query the source org for Name->Code maps to fill externalId code
+        components that SFDMU blanks to #N/A during extraction.
+
+        For each plan object, each single-hop externalId component ``Rel.Field``
+        (Field != Name) whose extracted column came back entirely #N/A is resolved
+        via ``SELECT Rel.Name, Rel.Field FROM Object`` on the source org.  Returns
+        ``{Object: {"Rel.Field": {Name: Code}}}``; empty when nothing needs it.
+        """
+        try:
+            with open(os.path.join(plan_dir, EXPORT_JSON_FILENAME), "r", encoding="utf-8") as f:
+                export_json = json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+        object_sets = export_json.get("objectSets") or [{"objects": export_json.get("objects", [])}]
+        code_map: Dict[str, Dict[str, dict]] = {}
+        seen = set()
+        for oset in object_sets:
+            for obj in oset.get("objects", []):
+                if obj.get("excluded"):
+                    continue
+                query = obj.get("query", "")
+                objname = query.split("FROM")[1].strip().split()[0] if "FROM" in query else None
+                external_id = obj.get("externalId", "")
+                if not objname or not external_id:
+                    continue
+                for comp in external_id.split(";"):
+                    comp = comp.strip()
+                    if comp.count(".") != 1:
+                        continue  # only single-hop Rel.Field; nested resolve via fallback
+                    rel, field = comp.split(".")
+                    if field == "Name":
+                        continue
+                    key = (objname, comp)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if not self._extracted_column_all_blank(output_dir, objname, comp):
+                        continue  # SFDMU resolved it (or target is a plan object)
+                    recs = self._sf_query_records(
+                        f"SELECT {rel}.Name, {rel}.{field} FROM {objname} WHERE {rel}.{field} != null"
+                    )
+                    mapping: Dict[str, str] = {}
+                    ambiguous = set()
+                    for r in recs:
+                        nested = r.get(rel) or {}
+                        name_val = nested.get("Name")
+                        code_val = nested.get(field)
+                        if name_val is None or code_val is None:
+                            continue
+                        if name_val in mapping and mapping[name_val] != code_val:
+                            ambiguous.add(name_val)
+                        else:
+                            mapping[name_val] = code_val
+                    for a in ambiguous:
+                        mapping.pop(a, None)  # don't guess when a Name maps to >1 Code
+                    if mapping:
+                        code_map.setdefault(objname, {})[comp] = mapping
+                        self.logger.info(
+                            f"Code-map: {objname}.{comp} <- {len(mapping)} {rel}.Name->{field} entries"
+                        )
+        return code_map
+
+    def _resolve_reference_plan_dir(self, plan_dir: str) -> Optional[str]:
+        """Resolve the reference plan dir used for golden-schema alignment.
+
+        Precedence: an explicit ``referenceplandir`` option wins ('none'/'false'
+        disables alignment); otherwise the qb/en-US sibling is auto-derived.
+        Logs the decision so the chosen schema source is visible in the run log.
+        """
+        opt = self.options.get("referenceplandir")
+        if opt is not None:
+            opt = str(opt).strip()
+            if opt.lower() in {"none", "false", ""}:
+                self.logger.info(
+                    "Reference-schema alignment disabled (referenceplandir=none); "
+                    "aligning to the plan's own CSVs."
+                )
+                return None
+            if not os.path.isdir(opt):
+                raise TaskOptionsError(f"referenceplandir not found: {opt}")
+            self.logger.info(f"Aligning processed CSVs to reference schema: {opt}")
+            return opt
+        derived = derive_qb_reference_plan_dir(plan_dir)
+        if derived:
+            self.logger.info(
+                f"Aligning processed CSVs to auto-derived qb reference schema: {derived}"
+            )
+        else:
+            self.logger.info(
+                "No qb reference sibling found; aligning to the plan's own CSVs."
+            )
+        return derived
+
+    def _run_task(self) -> None:
+        work_dir = None
+        try:
+            # Resolve org credentials
+            if "org" not in self.options or not self.options["org"]:
+                self._load_keychain()
+
+            plan_dir = self.options.get("pathtoexportjson", "datasets/sfdmu/")
+            if not os.path.isdir(plan_dir):
+                raise FileNotFoundError(f"Plan directory not found: {plan_dir}")
+
+            if isinstance(self.org_config, ScratchOrgConfig):
+                self.sourceusername = self.org_config.username
+            else:
+                self.sourceusername = self.options.get("sourceusername") or self.org_config.access_token
+
+            self.accesstoken = self.org_config.access_token
+            self.instanceurl = self.org_config.instance_url
+
+            # Prepare isolated working directory
+            work_dir = self._prepare_working_dir()
+            self._prepare_export_json(work_dir)
+
+            # Build and run SFDMU extract command
+            cmd = EXTRACT_COMMAND.format(
+                sourceusername=self.sourceusername,
+                pathtoexportjson=work_dir,
+            )
+            self.logger.info(f"Executing extraction: {cmd}")
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True,
+                cwd=self.options.get("dir"),
+            )
+
+            for line in result.stdout.splitlines():
+                self.logger.info(strip_ansi_codes(line))
+
+            if result.returncode != 0:
+                self.logger.error(f"SFDMU extraction failed (exit {result.returncode})")
+                self.logger.error(f"STDERR: {strip_ansi_codes(result.stderr)}")
+                raise CommandException(
+                    f"SFDMU extraction failed with exit code {result.returncode}"
+                )
+
+            # Move CSVs to final destination
+            output_dir = self._collect_output(work_dir)
+            self.logger.info(f"Extraction complete. Output: {output_dir}")
+            self.return_values = {"output_dir": output_dir}
+
+            # Optionally run post-process so output is re-import-ready ($$ columns, header normalization)
+            raw_run_post_process = self.options.get("run_post_process")
+            if raw_run_post_process is None:
+                run_post_process = True  # default when option is absent
+            else:
+                run_post_process = str(raw_run_post_process).strip().lower() not in {"0", "false", "no"}
+            if run_post_process:
+                processed_dir = os.path.join(output_dir, "processed")
+                os.makedirs(processed_dir, exist_ok=True)
+                reference_plan_dir = self._resolve_reference_plan_dir(plan_dir)
+                # Build an org-derived Name->Code map to restore externalId code
+                # components that SFDMU blanks to #N/A (cross-object .Code/.UnitCode).
+                code_map_file = None
+                code_map = self._build_code_backfill_map(plan_dir, output_dir)
+                if code_map:
+                    code_map_file = os.path.join(output_dir, "code_map.json")
+                    with open(code_map_file, "w", encoding="utf-8") as f:
+                        json.dump(code_map, f, indent=2, ensure_ascii=False)
+                    self.logger.info(f"Wrote code backfill map: {code_map_file}")
+                copy_to_plan = str(self.options.get("copy_to_plan", "")).strip().lower() in {"1", "true", "yes"}
+                run_post_process_script(
+                    output_dir, plan_dir, processed_dir,
+                    cwd=self.options.get("dir"), logger=self.logger,
+                    reference_plan_dir=reference_plan_dir,
+                    code_map_file=code_map_file,
+                    copy_to_plan=copy_to_plan,
+                )
+                if copy_to_plan:
+                    self.logger.info(f"Synced processed extraction into plan dir: {plan_dir}")
+                export_src = os.path.join(plan_dir, EXPORT_JSON_FILENAME)
+                shutil.copy2(export_src, os.path.join(processed_dir, EXPORT_JSON_FILENAME))
+                self.return_values["processed_dir"] = processed_dir
+                self.logger.info(f"Post-process complete. Re-import-ready CSVs: {processed_dir}")
+
+        except Exception as e:
+            self.logger.error(f"Extraction error: {e}")
+            raise
+        finally:
+            if work_dir and os.path.isdir(work_dir):
+                shutil.rmtree(work_dir, ignore_errors=True)
+                self.logger.info("Cleaned up extraction working directory.")
