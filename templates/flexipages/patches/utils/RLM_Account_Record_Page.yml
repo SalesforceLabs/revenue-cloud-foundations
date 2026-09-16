@@ -1,0 +1,8 @@
+feature: utils
+feature_flag: quantumbit
+# Adds the RLM QuickQuote flow action to the Account record page highlights panel.
+patches:
+  - type: insert_action
+    after: "Edit"
+    actions:
+      - "Account.RLM_QuickQuote"

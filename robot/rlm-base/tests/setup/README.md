@@ -1,0 +1,166 @@
+# Setup Automation (Robot Framework)
+
+Robot Framework tests that configure Salesforce Setup page options that cannot be set via Metadata API. These include toggles, picklist selections, and text inputs across multiple Lightning Setup pages (Revenue Settings, General Settings, Pricing Setup, and more).
+
+## Test Suites
+
+| Suite | CCI Task | Description |
+|-------|----------|-------------|
+| `enable_document_builder.robot` | `enable_document_builder_toggle` | Enable Document Builder on Revenue Settings, then Design Document Templates in Salesforce and Document Templates Export on General Settings (Design must run before Export — it is a prerequisite) |
+| `enable_constraints_settings.robot` | `enable_constraints_settings` | Set Default Transaction Type, Asset Context picklist, and enable Constraints Engine toggle |
+| `configure_revenue_settings.robot` | `configure_revenue_settings` | Set Pricing Procedure, Usage Rating Procedure, enable Instant Pricing toggle, and configure Revenue Settings flow API names |
+| `configure_core_pricing_setup.robot` | `configure_core_pricing_setup` | Set default Pricing Procedure on Salesforce Pricing Setup page (CorePricingSetup) |
+| `configure_product_discovery_settings.robot` | `configure_product_discovery_settings` | Set the Default Catalog on Product Discovery Settings (`/lightning/setup/ProductDiscoverySettings/home`) via JS shadow-DOM traversal; gated by `project__custom__qb` in `prepare_pricing_discovery` |
+
+## Prerequisites
+
+Install and verify prerequisites in the **local installation guide**: [Setup for headless robot runs](../../../../docs/guides/local-installation.md#setup-for-headless-robot-runs). That guide is the single source of truth for:
+
+- **Python packages:** Robot Framework, SeleniumLibrary, webdriver-manager, urllib3 ≥ 2.6.3
+- **Chrome or Chromium:** Required for headless runs (macOS, Linux, CI install steps in the local installation guide)
+- **ChromeDriver:** Provided by webdriver-manager at runtime, or install on PATH
+- **Salesforce CLI:** For `sf org open --url-only` authenticated sessions
+
+Run `cci task run validate_setup` to verify all dependencies. Tests run headless by default. If you see **"Timeout value connect was &lt;object object at ...&gt;"** during suite setup, ensure urllib3 ≥ 2.6.3 is installed; see [Troubleshooting](../../../../docs/guides/org-operations.md#troubleshooting).
+
+## Running Tests
+
+Run from the repo root. CCI uses its own org aliases; direct Robot commands use an SF CLI alias or username. The wrappers pass the selected org's username to the browser suite, which uses `sf org open --url-only` for an authenticated session.
+
+### Via CCI (recommended)
+
+```bash
+# Document Builder uses the default CCI org; its wrapper rejects --org
+cci org default my-scratch
+cci task run enable_document_builder_toggle
+
+# These wrappers also accept an explicit CCI org alias
+cci task run enable_constraints_settings --org my-scratch
+cci task run configure_revenue_settings --org my-scratch
+cci task run configure_core_pricing_setup --org my-scratch
+cci task run configure_product_discovery_settings --org my-scratch
+
+# As part of the full org build
+cci flow run prepare_rlm_org --org my-scratch
+```
+
+### Via Robot Framework directly
+
+In the examples below, replace `my-scratch` with the **SF CLI** alias or username,
+which may differ from the CCI alias above (for example, `rlm-base__my-scratch`).
+
+```bash
+# Document Builder
+robot -v ORG_ALIAS:my-scratch robot/rlm-base/tests/setup/enable_document_builder.robot
+
+# Constraints prerequisites
+robot -v ORG_ALIAS:my-scratch robot/rlm-base/tests/setup/enable_constraints_settings.robot
+
+# Revenue Settings (Pricing, Usage Rating, Instant Pricing, Create Orders Flow, Create Contracts Flow, Manage Assets Flow)
+robot -v ORG_ALIAS:my-scratch robot/rlm-base/tests/setup/configure_revenue_settings.robot
+
+# Salesforce Pricing Setup (CorePricingSetup default Pricing Procedure)
+robot -v ORG_ALIAS:my-scratch robot/rlm-base/tests/setup/configure_core_pricing_setup.robot
+
+# Product Discovery Settings (Default Catalog)
+robot -v ORG_ALIAS:my-scratch robot/rlm-base/tests/setup/configure_product_discovery_settings.robot
+```
+
+If you don't set `ORG_ALIAS` and the browser opens on a Salesforce login page, log in within the configured wait (default 90s); the test will then reload the target Setup page.
+
+## Variables
+
+### Common Variables (all suites)
+
+| Variable | Description |
+|----------|-------------|
+| `ORG_ALIAS` | **Recommended.** Org username or alias for authenticated browser session via `sf org open --url-only`. |
+| `REVENUE_SETTINGS_URL` | Full URL to Revenue Settings when not using ORG_ALIAS. |
+| `MANUAL_LOGIN_WAIT` | Wait time for manual login if no org alias (default: `90s`). |
+
+### enable_document_builder.robot
+
+| Variable | Description |
+|----------|-------------|
+| `DOCUMENT_BUILDER_PREREQUISITE_LABEL` | Toggle to enable first (prerequisite). Default: empty (skip). |
+| `DOCUMENT_BUILDER_TOGGLE_LABEL` | Label of the Document Builder toggle (default: "Document Builder"). |
+| `DOC_TEMPLATES_EXPORT_LABEL` | Label of the Document Templates Export toggle on General Settings (default: "Document Templates Export"). |
+| `DESIGN_DOC_TEMPLATES_LABEL` | Label of the Design Document Templates toggle on General Settings (default: "Design Document Templates in Salesforce"). |
+
+### enable_constraints_settings.robot
+
+| Variable | Description |
+|----------|-------------|
+| `DEFAULT_TRANSACTION_TYPE_VALUE` | Value for Default Transaction Type dropdown (default: "Advanced Configurator"). |
+| `ASSET_CONTEXT` | Value for Asset Context picklist (default: "RLM_AssetContext"). |
+
+### configure_revenue_settings.robot
+
+| Variable | Description |
+|----------|-------------|
+| `PRICING_PROCEDURE` | Default pricing procedure name (default: "RLM Revenue Management Default Pricing Procedure"). |
+| `USAGE_RATING_PROCEDURE` | Default usage rating procedure name (default: "RLM Default Rating Discovery Procedure"). |
+| `CREATE_ORDERS_FLOW` | API name of the Create Orders from Quotes flow (default: "RLM_CreateOrdersFromQuote"). |
+| `CREATE_CONTRACTS_FLOW` | API name of the Create Contracts from Quotes flow. Empty by default; `prepare_revenue_settings` sets it to `RLM_CreateContractFromQuote` for QuantumBit/TSO orgs. |
+| `MANAGE_ASSETS_FLOW` | API name of the Manage Assets flow. Empty by default; `prepare_revenue_settings` sets it to `RLM_ARC_Assets` for QuantumBit/TSO orgs. |
+
+### configure_core_pricing_setup.robot
+
+| Variable | Description |
+|----------|-------------|
+| `PRICING_PROCEDURE` | Default pricing procedure name for CorePricingSetup (default: "RLM Revenue Management Default Pricing Procedure"). |
+
+### configure_product_discovery_settings.robot
+
+| Variable | Description |
+|----------|-------------|
+| `DEFAULT_CATALOG` | Catalog name to set as the Default Catalog on Product Discovery Settings (default: "QuantumBit Software"). |
+
+## Implementation Notes
+
+### Shadow DOM Toggles
+
+Many LWC toggles on Setup pages (Constraints Engine, Instant Pricing, Document Templates Export, Design Document Templates, etc.) are inside Lightning Web Component Shadow DOM boundaries, making them inaccessible to standard Selenium XPath locators. The `SetupToggles.robot` resource library handles this in two ways:
+
+1. **`_EnsureShadowDOMToggle`** — Uses pure JavaScript to find the label heading via a text-node tree walker, walks up to the nearest ancestor containing a `lightning-input` toggle, pierces its shadow root, reads the `checked` state, and clicks only if needed. This avoids the cross-section interference caused by XPath `following::*[@role='switch']` which cannot see into shadow roots and may match the wrong toggle.
+2. **`_VerifyToggleViaShadowDOM`** — Uses the same JS approach to verify the toggle's actual `checked` state after clicking, replacing the previous section-text ("Enabled"/"Disabled") heuristic which was unreliable when the section XPath itself couldn't scope correctly.
+
+For Document Builder specifically, a dedicated `_EnsureDocumentBuilderToggle` keyword uses `findInShadows` to locate the `input[name=documentBuilderEnabled]` element.
+
+### Combobox-Recipe Fields (Pricing, Usage Rating, Asset Context)
+
+The Pricing Procedure, Usage Rating Procedure, and Asset Context fields all use an identical custom LWC pattern: a `div.container-combobox-recipe` inside the `runtime_revenue_admin_console-rev-lifecycle-mgmt-settings` component. The page uses Salesforce's **synthetic shadow DOM**, meaning these elements are accessible from XPath but share a flat DOM namespace. Each field lives in its own `<li class="slds-setup-assistant__item">` setup-assistant step.
+
+**Field behavior:**
+- **When not set:** The step content area is initially empty (lazy-rendered). Clicking the step title expands it and renders a combobox dropdown with available options.
+- **When set:** The dropdown is replaced by a pill (`span.slds-pill`) showing the selected value, with an X button (visible on hover) to clear it.
+
+**`<li>`-scoped XPath approach:** All element searches (pills, select dropdowns, comboboxes, clear buttons) are scoped to the parent `<li>` element using XPath like `//li[.//span[contains(text(), 'Set Up Salesforce Pricing')]]//select`. This prevents cross-section interference — the `following::` XPath axis previously caused the Pricing/Usage Rating automation to accidentally find and clear the Asset Context field further down the page.
+
+**Page reload between procedure fields:** After setting the Pricing Procedure, the page is reloaded before setting Usage Rating. This clears a transitional page state where the Usage Rating combobox opens but shows zero options. The reload ensures a clean DOM for the second combobox interaction.
+
+### Default Transaction Type (Lightning Combobox)
+
+The Default Transaction Type field is a `<lightning-combobox>` component (distinct from the combobox-recipe pattern above). It is handled by the `_Set Via Lightning Combobox` keyword which uses standard `role='combobox'` and `role='option'` XPath selectors.
+
+### Idempotency
+
+All tests detect current state before making changes:
+- **Toggles:** Read `checked` property via JavaScript; skip click if already enabled
+- **Combobox-recipe fields (Pricing, Usage Rating, Asset Context):** Check if correct value is shown in pill within the scoped `<li>`; skip if matched. If wrong value, clear pill, wait for dropdown, select correct value.
+- **Lightning combobox (Transaction Type):** Check `Get Selected List Label`; skip if already correct
+- **Text inputs (Create Orders, Create Contracts, Manage Assets flows):** Compare current value; skip if already correct
+
+## CumulusCI Flow Integration
+
+| Task | Flow | Step |
+|------|------|------|
+| `enable_document_builder_toggle` | `prepare_docgen` | Step 2 |
+| `enable_constraints_settings` | `prepare_constraints` | Step 5 (when `constraints_data` is true) |
+| `configure_revenue_settings` | `prepare_rlm_org` | Step 25 (via `prepare_revenue_settings`) |
+| `configure_core_pricing_setup` | `prepare_rlm_org` | Step 25 (via `prepare_revenue_settings`, step 3) |
+| `configure_product_discovery_settings` | `prepare_rlm_org` | Via `prepare_pricing_discovery`, step 2 (gated by `project__custom__qb`) |
+
+## Generated Output
+
+Running any test produces log and report files in `robot/rlm-base/results/` (or `--outputdir`). On failure, screenshots are saved automatically. This directory is in `.gitignore`; do not commit its contents. To remove local run artifacts: `rm -f robot/rlm-base/results/*`.

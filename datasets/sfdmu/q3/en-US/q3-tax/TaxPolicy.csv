@@ -1,0 +1,4 @@
+Description,Name,Status,TreatmentSelection
+,Tax Policy for non-taxable products,Draft,Manual
+Test Tax Policy,Tax Policy for taxable products,Draft,Default
+,Tax Policy for LE,Draft,LegalEntity

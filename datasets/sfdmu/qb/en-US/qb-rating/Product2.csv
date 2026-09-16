@@ -1,0 +1,11 @@
+Name,ProductCode,StockKeepingUnit,UsageModelType
+QuantumBit Database (Token Commit - Each),QB-CMT-TKN-EACH,QB-CMT-TKN-EACH,Commit
+QuantumBit Database (Token Commit - Flat),QB-CMT-TKN-FLAT,QB-CMT-TKN-FLAT,Commit
+QuantumBit Database (Token Commit - Bounded),QB-CMT-TKN-BND,QB-CMT-TKN-BND,Commit
+QuantumBit Database (Token Commit - Tier),QB-CMT-TKN-TIER,QB-CMT-TKN-TIER,Commit
+Additional Data Throughput,QB-DAT-THPT,QB-DAT-THPT,Pack
+QuantumBit Database,QB-DB,QB-DB,Anchor
+QuantumBit Database (Token Based),QB-DB-TOKEN,QB-DB-TOKEN,Anchor
+QuantumBit Database (Monetary Commit),QB-MTY-CMT,QB-MTY-CMT,CommitmentSpend
+QuantumBit Database (Quantity Commit),QB-QTY-CMT,QB-QTY-CMT,CommitmentQuantity
+QuantumBit Tokens Pack,QB-TOKENS-PACK,QB-TOKENS-PACK,Pack

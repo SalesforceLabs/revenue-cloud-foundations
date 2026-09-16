@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PermissionSetGroup xmlns="http://soap.sforce.com/2006/04/metadata">
+    <description>Revenue Cloud Configurator Permission Sets</description>
+    <hasActivationRequired>false</hasActivationRequired>
+    <label>RLM_CFG</label>
+    <permissionSets>force__AdvancedConfiguratorDesigner</permissionSets>
+    <permissionSets>force__IndustriesConfiguratorPlatformApi</permissionSets>
+    <permissionSets>force__ProductConfigurationRulesDesigner</permissionSets>
+</PermissionSetGroup>

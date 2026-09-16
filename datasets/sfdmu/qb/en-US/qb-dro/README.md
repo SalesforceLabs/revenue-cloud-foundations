@@ -1,0 +1,341 @@
+# qb-dro Data Plan
+
+SFDMU data plan for QuantumBit (QB) Dynamic Revenue Orchestrator (DRO) configuration. Creates fulfillment step definitions, groups, dependencies, decomposition rules, fulfillment scenarios, workspaces, fallout rules, jeopardy rules, and updates products with DRO-specific fields. Uses dynamic user resolution at runtime.
+
+> **SFDMU 5.6.4+ floor.** The plan is `Upsert` throughout; only FulfillmentWorkspaceItem adds `deleteOldData: true`, because its externalId is a composite of two relationship traversals (`FulfillmentWorkspace.Name;FulfillmentStepDefinitionGroup.Name`) that pre-5.6.4 Upsert could not match — **fixed at/below the 5.6.4 floor**. The shipped plan keeps the workaround deliberately; dropping `deleteOldData` is the gated `sfdmu-v5-optimization` initiative (live verification + explicit approval required).
+
+## CCI Integration
+
+### Flow: `prepare_dro`
+
+This plan is executed as **step 1** of the `prepare_dro` flow (when `dro=true`, `qb=true`).
+
+| Step | Task                             | Description                                            |
+|------|----------------------------------|--------------------------------------------------------|
+| 1    | `insert_qb_dro_data`            | Runs this SFDMU plan (single pass, dynamic user)       |
+| 4    | `update_product_fulfillment_decomp_rules` | **Temporary fix (260 bug)** — see below |
+
+**Note:** Unlike billing and tax, DRO records do not have a status lifecycle. Step 4 runs an Apex update as a temporary fix for a 260 bug (see below). A separate `create_dro_rule_library` task (in `prepare_core`) creates the DRO Rule Library record.
+
+**Step 4 — Missing ExecuteOnRuleId (Known 260 Bug):** Rule is created on UPDATE of ProductFulfillmentDecompRule via Platform APIs and is NOT created on INSERT (same applies for ProductFulfillmentScenario, FulfillmentStepDefinition, FulfillmentTaskAssignmentRule). If a condition was set at creation time, ExecuteOnRuleId (the ruleset) is not generated — the rule fires in decomposition but the orchestration plan won't pick it up properly. Fix: Edit and re-save the PFDR record after creation to trigger ruleset generation. (Confirmed in #rlm-office-hours)
+
+### Task Definition
+
+```yaml
+insert_qb_dro_data:
+  class_path: tasks.rlm_sfdmu.LoadSFDMUData
+  options:
+    pathtoexportjson: "datasets/sfdmu/qb/en-US/qb-dro"
+    dynamic_assigned_to_user: true
+```
+
+## Data Plan Overview
+
+The plan uses a **single SFDMU pass** with 17 objects (13 loaded + 3 ReadOnly lookups + 1 excluded). No activation is required.
+
+```
+Single Pass (SFDMU)
+────────────────────────────────────────────────────
+Upsert all DRO objects in dependency order
+(dynamic user resolution for AssignedTo fields)
+```
+
+### Objects
+
+> **SFDMU v5 Required.** ExternalIDs have been simplified for v5 compatibility and idempotency.
+
+| #  | Object                          | Operation | External ID                                                        | Records | v5 Notes |
+|----|---------------------------------|-----------|--------------------------------------------------------------------|---------|----------|
+| 1  | Product2                        | Update    | `StockKeepingUnit`                                                 | 314     | |
+| 2  | ProductFulfillmentDecompRule    | Upsert    | `Name`                                                             | 21      | Consolidated service line decomps; removed standalone QB-DB-TOKEN rules |
+| 3  | ValTfrmGrp                      | Upsert    | `Name`                                                             | 0       | |
+| 4  | ValTfrm                         | Upsert    | `Name`                                                             | 0       | |
+| 5  | FulfillmentStepDefinitionGroup  | Upsert    | `Name`                                                             | 5       | Consolidated from 10 → 5 groups; all typed `Fulfillment` |
+| 6  | User                            | ReadOnly  | `Name`                                                             | 1       | Lookup only — dynamic user resolution for AssignedTo |
+| 7  | Group                           | ReadOnly  | `Name`                                                             | 0       | Lookup only — Queue references (`WHERE Type = 'Queue'`) |
+| 8  | IntegrationProviderDef          | ReadOnly  | `DeveloperName`                                                    | 4       | Lookup only — referenced by FSD/FFR/FSJR |
+| 9  | FulfillmentStepDefinition       | Upsert    | `Name`                                                             | 10      | Simplified from 17; removed Order Processing/Asset Conversion/Tenant Provisioning steps |
+| 10 | FulfillmentStepDependencyDef    | Upsert    | `Name`                                                             | 9       | Simplified from 13; removed dependencies on deleted steps |
+| 11 | ProductFulfillmentScenario      | Upsert    | `Name`                                                             | 10      | Simplified from 13; removed standalone QB-DB-TOKEN scenarios |
+| 12 | FulfillmentWorkspace            | Upsert    | `Name`                                                             | 1       | QuantumBit Complete Solution Bundle (Ramp Deal Orchestration removed) |
+| 13 | FulfillmentWorkspaceItem        | Upsert    | `FulfillmentWorkspace.Name;FulfillmentStepDefinitionGroup.Name`    | 4       | `deleteOldData: true` (auto-number Name) |
+| 14 | FulfillmentFalloutRule          | Upsert    | `Name`                                                             | 3       | |
+| 15 | FulfillmentStepJeopardyRule     | Upsert    | `Name`                                                             | 6       | |
+| 16 | FulfillmentTaskAssignmentRule   | Upsert    | `Name`                                                             | 0       | |
+
+**Note:** Objects 3-4 (ValTfrmGrp, ValTfrm) and Object 16 (FulfillmentTaskAssignmentRule) have empty CSVs (0 data records) — placeholders for future data. ProductDecompEnrichmentRule is excluded (`excluded: true` in export.json) and has no CSV on disk. Product2 is Update-only (sets `CustomDecompositionScope`, `DecompositionScope`, `FulfillmentQtyCalcMethod`).
+
+## Dynamic User Resolution
+
+The plan uses a **runtime placeholder** `__DRO_ASSIGNED_TO_USER__` for the `AssignedTo.Name` field on `FulfillmentStepDefinition` records. At load time, the CCI task (`dynamic_assigned_to_user: true`) resolves this placeholder to the target org's default user name.
+
+Supporting files:
+- `User.csv` and `UserAndGroup.csv` contain the placeholder value `__DRO_ASSIGNED_TO_USER__` — SFDMU requires these for User/Group lookup resolution
+- `FulfillmentStepDefinition.csv` references `AssignedTo.Name` with the same placeholder
+
+This ensures the plan works across any org without hardcoded user references.
+
+## Key Object Groups
+
+### Product DRO Configuration (Objects 1-2)
+
+Product2 Update sets DRO-specific fields (`CustomDecompositionScope`, `DecompositionScope`, `FulfillmentQtyCalcMethod`). ProductFulfillmentDecompRule defines how products decompose from source to destination (21 rules mapping parent products to fulfillment sub-products).
+
+### Value Transforms (Objects 3-4) — Placeholders
+
+ValTfrmGrp and ValTfrm are empty placeholders for value transformation groups and mappings. These may be needed for attribute mapping during decomposition in future configurations.
+
+### Enrichment Rules — Excluded
+
+ProductDecompEnrichmentRule is present in export.json with `excluded: true` (it has no CSV on disk). It would map attributes between source and destination products for decomposition enrichment, but is not loaded in the current plan.
+
+### Fulfillment Steps (Objects 5, 9-10)
+
+Three-level hierarchy: FulfillmentStepDefinitionGroup (5 groups: Finance, Platform, Services, Provisioning & Activation, Usage Provisioning & Activation — all typed `Fulfillment`) -> FulfillmentStepDefinition (10 steps like "Provision Licensing/Features", "Activate Tokens") -> FulfillmentStepDependencyDef (9 dependency links between steps).
+
+### Fulfillment Scenarios (Object 11)
+
+ProductFulfillmentScenario (10 records) maps products to their fulfillment step groups and actions (e.g., "Finance Service", "QuantumBit Database Provisioning").
+
+### Workspaces (Objects 12-13)
+
+FulfillmentWorkspace (1 workspace: QuantumBit Complete Solution Bundle) with FulfillmentWorkspaceItem (4 items) defining the UI layout for fulfillment management.
+
+### Rules (Objects 14-16)
+
+FulfillmentFalloutRule (3 rules) for error handling, FulfillmentStepJeopardyRule (6 rules) for SLA monitoring, and FulfillmentTaskAssignmentRule (0 records — placeholder).
+
+## Composite External IDs (v5)
+
+With the SFDMU v5 migration, most composite externalIds were simplified to just `Name` after ensuring Name uniqueness in the source CSVs. The `$$` composite key columns have been removed from all DRO CSVs.
+
+| Object                        | v5 ExternalId | Previous (v4) | Change |
+|-------------------------------|---------------|----------------|--------|
+| ProductFulfillmentDecompRule  | `Name` | `Name` | Consolidated service line decomps; removed standalone QB-DB-TOKEN rules |
+| FulfillmentStepDefinition     | `Name` | `Name;StepDefinitionGroup.Name` | Consolidated from 17 → 10 steps; all Names unique |
+| FulfillmentStepDependencyDef  | `Name` | `Name;DependsOn.Name;FSD.Name` | Simplified from 13 → 9 deps |
+| ProductFulfillmentScenario    | `Name` | `Name;Product.StockKeepingUnit` | Simplified from 13 → 10; removed standalone QB-DB-TOKEN scenarios |
+| FulfillmentWorkspaceItem      | `FulfillmentWorkspace.Name;FulfillmentStepDefinitionGroup.Name` | Same | `deleteOldData: true` added (auto-number Name) |
+
+## Portability
+
+All external IDs use portable, human-readable fields:
+
+- **Name** fields: All human-readable (e.g., "Finance", "Provision Licensing/Features", "Finance Service")
+- **StockKeepingUnit** for Product2 references
+- **DeveloperName** for IntegrationDefinition references
+- **Dynamic user resolution**: `__DRO_ASSIGNED_TO_USER__` placeholder ensures cross-org compatibility
+
+**Auto-numbered Name fields**: FulfillmentWorkspaceItem uses an auto-number Name — matched via its parent composite key with `deleteOldData: true` for functional idempotency.
+
+## Lookup CSVs and Extra Files
+
+`User.csv`, `Group.csv`, and `IntegrationProviderDef.csv` are **referenced in `export.json`** as `ReadOnly` lookup objects (not "extra" files):
+
+- `User.csv` (1 record — placeholder for dynamic user resolution; required for AssignedTo lookup)
+- `Group.csv` (0 records — Queue lookup; `WHERE Type = 'Queue'`)
+- `IntegrationProviderDef.csv` (4 records — `DeveloperName`; referenced by FSD/FFR/FSJR)
+
+One CSV exists in the directory but is **not referenced** in `export.json`:
+
+- `UserAndGroup.csv` (1 record — placeholder for dynamic user resolution)
+
+This is a supporting file for the dynamic user resolution mechanism; it is not loaded as an object by the plan.
+
+## Dependencies
+
+**Upstream:**
+- **qb-pcm** — Product2 records must exist (matched by `StockKeepingUnit`)
+- **`create_dro_rule_library`** (in `prepare_core`) — Creates the DRO RuleLibrary record
+
+**Downstream:**
+- Runtime DRO engine consumes this configuration for order decomposition and fulfillment orchestration
+
+## File Structure
+
+```
+qb-dro/
+├── export.json                          # SFDMU data plan (single pass, 17 objects)
+├── README.md                            # This file
+│
+│  Source CSVs — Products
+├── Product2.csv                         # 314 records (Update only)
+│
+│  Source CSVs — Decomposition
+├── ProductFulfillmentDecompRule.csv     # 21 records
+├── ValTfrmGrp.csv                       # 0 records (placeholder)
+├── ValTfrm.csv                          # 0 records (placeholder)
+│
+│  Source CSVs — Fulfillment Steps
+├── FulfillmentStepDefinitionGroup.csv   # 5 records
+├── FulfillmentStepDefinition.csv        # 10 records
+├── FulfillmentStepDependencyDef.csv     # 9 records
+│
+│  Source CSVs — Scenarios and Workspaces
+├── ProductFulfillmentScenario.csv       # 10 records
+├── FulfillmentWorkspace.csv             # 1 record
+├── FulfillmentWorkspaceItem.csv         # 4 records
+│
+│  Source CSVs — Rules
+├── FulfillmentFalloutRule.csv           # 3 records
+├── FulfillmentStepJeopardyRule.csv      # 6 records
+├── FulfillmentTaskAssignmentRule.csv    # 0 records (placeholder)
+│
+│  Source CSVs — ReadOnly lookups (in export.json)
+├── User.csv                             # 1 record (dynamic user placeholder; required for AssignedTo)
+├── Group.csv                            # 0 records (Queue lookup)
+├── IntegrationProviderDef.csv           # 4 records (DeveloperName reference)
+│
+│  Source CSVs — Supporting (not in export.json)
+├── UserAndGroup.csv                     # 1 record (dynamic user placeholder)
+│
+│  SFDMU Runtime (gitignored)
+├── source/                              # SFDMU-generated source snapshots
+└── target/                              # SFDMU-generated target snapshots
+```
+
+## Idempotency
+
+> **Verified with SFDMU v5** on a 260 scratch org.
+
+This plan is idempotent — re-running on an org that already has the data produces zero net record changes for successfully inserted objects.
+
+- Objects with `Name` externalIds (PFDR, FSD, FSDD, PFS, FSDG, FW, FFR, FSJR): matched correctly on re-run, no duplicates
+- **FulfillmentWorkspaceItem**: uses `deleteOldData: true` (delete + reinsert cycle) since its Name is auto-numbered
+- **TaxEngine**: always inserts 1 record (Salesforce metadata-like limitation)
+
+### Known limitations
+
+- **FulfillmentStepDefinition**: All 10 records insert successfully when `User.csv` and `UserAndGroup.csv` are present with the resolved user Name (via `dynamic_assigned_to_user: true`). The CSV must use `AssignedTo.Name` (not `AssignedToId$User.Name`) for SFDMU to resolve the lookup correctly. Two steps (Create Project, Start Project) have empty AssignedTo — these are Milestones with no manual assignee.
+
+## 260 Schema Analysis (Confirmed via Org Describe)
+
+Schema was queried against a 260 scratch org. Findings below.
+
+### Polymorphic Fields
+
+5 polymorphic fields found across DRO objects (excluding standard OwnerId):
+
+| Object                        | Field                   | Label                       | Polymorphic Targets                   | In Current SOQL? |
+|-------------------------------|-------------------------|-----------------------------|---------------------------------------|-------------------|
+| **FulfillmentStepDefinition** | `AssignedToId`          | Assigned To ID              | **Group, User**                       | Yes (dynamic user)|
+| **FulfillmentStepDefinition** | `ExecuteOnRuleId`       | Execute On Rule ID          | **ExpressionSet, Ruleset**            | No (not in query) |
+| **FulfillmentStepDefinition** | `ResumeOnRuleId`        | Resume On Rule ID           | **ExpressionSet, Ruleset**            | Yes (in query)    |
+| **FulfillmentTaskAssignmentRule** | `DestinationId`     | Assignment Destination ID   | **Group, User**                       | Yes (in query)    |
+| **FulfillmentTaskAssignmentRule** | `ConditionId`       | Assignment Condition ID     | **ExpressionSet, Ruleset**            | Yes (in query)    |
+| **ProductDecompEnrichmentRule** | `CalculationDefinitionId` | Calculation Definition ID | **DecisionMatrixDefinition, ExpressionSet** | No (not in query) |
+
+**Notes:**
+- `AssignedToId` is already handled via `dynamic_assigned_to_user: true` (runtime placeholder substitution)
+- `ExecuteOnRuleId` exists in the 260 schema but is **not in the current SOQL query** — if used, needs `$ExpressionSet` or `$Ruleset` suffix
+- `ResumeOnRuleId` is in the current SOQL but the polymorphic targets are not handled — currently the field is always null in the data
+- `DestinationId` and `ConditionId` on FulfillmentTaskAssignmentRule are polymorphic but the CSV is empty (0 records)
+- `CalculationDefinitionId` on ProductDecompEnrichmentRule is polymorphic but the CSV is empty (0 records)
+
+### New Fields Found in 260 (Not in Current SOQL)
+
+| Object                        | Field                    | Type        | Notes                                           |
+|-------------------------------|--------------------------|-------------|--------------------------------------------------|
+| **FulfillmentStepDefinition** | `RunAsUserId`            | REFERENCE   | Lookup to User — run-as user for step execution  |
+| **FulfillmentStepDefinition** | `ExecuteOnConditionData` | TEXTAREA    | JSON condition data for execution rules          |
+| **FulfillmentStepDefinition** | `ResumeOnConditionData`  | TEXTAREA    | JSON condition data for resume rules             |
+| **FulfillmentStepDefinition** | `ExecuteOnRuleId`        | POLY REF    | ExpressionSet or Ruleset (see above)             |
+| **FulfillmentTaskAssignmentRule** | `ConditionData`     | TEXTAREA    | JSON condition data                              |
+| **FulfillmentTaskAssignmentRule** | `UsageType`          | PICKLIST    | Usage type categorization                        |
+| **ProductFulfillmentScenario** | `ScenarioRuleId`        | REFERENCE   | Lookup to Ruleset — scenario execution rules     |
+| **ProductFulfillmentDecompRule** | `ExecuteOnRuleId`     | REFERENCE   | Lookup to Ruleset — conditional decomposition    |
+
+### Self-Referencing Fields
+
+| Object          | Field             | Notes                                         |
+|-----------------|-------------------|-----------------------------------------------|
+| UsageResource   | `TokenResourceId` | Self-ref to UsageResource (in qb-rating plan) |
+
+No self-references in DRO-specific objects.
+
+### Cross-Object References to Non-Plan Objects
+
+Several DRO objects reference objects that are **not in the current export.json**:
+
+| Referenced Object           | Referenced By                                              | Notes                            |
+|-----------------------------|------------------------------------------------------------|----------------------------------|
+| `IntegrationProviderDef`    | FulfillmentStepDefinition, FulfillmentFalloutRule, FulfillmentStepJeopardyRule | In export.json as ReadOnly lookup |
+| `ExpressionSet`             | FulfillmentStepDefinition (ExecuteOnRuleId, ResumeOnRuleId), FulfillmentTaskAssignmentRule (ConditionId), ProductDecompEnrichmentRule (CalculationDefinitionId) | Not referenced anywhere in plan  |
+| `Ruleset`                   | FulfillmentStepDefinition (ExecuteOnRuleId, ResumeOnRuleId), FulfillmentTaskAssignmentRule (ConditionId), ProductFulfillmentScenario (ScenarioRuleId), ProductFulfillmentDecompRule (ExecuteOnRuleId) | Not referenced anywhere in plan  |
+| `DecisionMatrixDefinition`  | ProductDecompEnrichmentRule (CalculationDefinitionId)      | Not referenced anywhere in plan  |
+| `AttributePicklistValue`    | ValTfrm (InputPicklistValueId, OutputPicklistValueId)      | Not referenced anywhere in plan  |
+| `Group`                     | FulfillmentFalloutRule (FalloutQueueId), FulfillmentTaskAssignmentRule (SourceId, DestinationId) | In export.json as ReadOnly lookup (Queue references) |
+
+### Plan for Polymorphic Field Support
+
+When DRO features are enhanced for 260, the following polymorphic handling will be needed:
+
+**FulfillmentStepDefinition:**
+- `AssignedToId` — already handled via `__DRO_ASSIGNED_TO_USER__` dynamic resolution. For Group assignment, would need `AssignedToId$Group` with Group.Name lookup.
+- `ExecuteOnRuleId` — if used, needs separate handling: `ExecuteOnRuleId$ExpressionSet` (by DeveloperName) or `ExecuteOnRuleId$Ruleset` (by Name/DeveloperName). May need polymorphic `$` suffix in SOQL.
+- `ResumeOnRuleId` — same pattern as ExecuteOnRuleId.
+
+**FulfillmentTaskAssignmentRule:**
+- `DestinationId` — `DestinationId$User` (by Name) or `DestinationId$Group` (by Name). Similar to AssignedTo handling.
+- `ConditionId` — `ConditionId$ExpressionSet` or `ConditionId$Ruleset`.
+
+**ProductDecompEnrichmentRule:**
+- `CalculationDefinitionId` — `CalculationDefinitionId$DecisionMatrixDefinition` or `CalculationDefinitionId$ExpressionSet`.
+
+## External ID / Composite Key Analysis (Confirmed via Org Describe)
+
+### Schema-Enforced Unique Fields
+
+**None found.** No DRO objects have schema-enforced unique fields. All externalIds rely on convention-unique Names.
+
+### Auto-Numbered Name Fields (Portability Assessment)
+
+| Object                       | Name Auto-Num | Current ExternalId                                  | Assessment |
+|------------------------------|---------------|-----------------------------------------------------|------------|
+| FulfillmentWorkspaceItem     | **Yes**       | `FW.Name;FSDG.Name`                                | ✅ Good — composite from parents |
+| FulfillmentFalloutRule       | **Yes**       | `Name`                                              | **PROBLEM** — auto-num Name |
+| FulfillmentStepJeopardyRule  | **Yes**       | `Name`                                              | **PROBLEM** — auto-num Name |
+| ValTfrm                      | **Yes**       | `Name`                                              | **PROBLEM** — auto-num Name |
+| ProductDecompEnrichmentRule  | **Yes**       | `Name`                                              | **PROBLEM** — auto-num Name |
+
+### Portability Fixes Needed
+
+**FulfillmentFalloutRule** (`Name` auto-num): No lookup fields to parent. Available fields: `ErrorCode`, `FlowDefinitionName`, `StepType`, `FalloutQueueId`, `IntegrationDefinitionId`, `RetriesAllowed`, `RetryIntervals`, `RetryPolicy`. Consider a composite of `StepType;ErrorCode` or assign human-readable Names if possible.
+
+**FulfillmentStepJeopardyRule** (`Name` auto-num): Available fields: `EstimatedDuration`, `EstimatedDurationUnit`, `FlowDefinition`, `StepType`, `JeopardyThreshold`, `JeopardyThresholdUnit`, `IntegrationDefinition.DeveloperName`. Consider `StepType;IntegrationDefinition.DeveloperName` or assign human-readable Names.
+
+**ValTfrm** (`Name` auto-num): Has parent `ValueTransformGroupId`. Consider `ValTfrmGrp.Name;InputString` or another composite from the transformation's input/output values.
+
+**ProductDecompEnrichmentRule** (`Name` auto-num): Has parent `DecompositionRuleId`. Schema provides `SourceAttributeIdentifier` and `DestinationAttributeIdentifier` as `idLookup` fields. Consider `DecompositionRule.Name;SourceAttributeIdentifier;DestinationAttributeIdentifier` as a portable composite.
+
+### ExternalId Assessment (Non-Auto-Num Objects)
+
+| Object                        | Current ExternalId                               | Assessment |
+|-------------------------------|--------------------------------------------------|------------|
+| Product2                      | `StockKeepingUnit`                               | ✅ OK — platform-enforced unique when RLM enabled |
+| ProductFulfillmentDecompRule  | `Name`                                           | ✅ OK — disambiguated duplicate Names |
+| ValTfrmGrp                    | `Name`                                           | ✅ OK — human-readable |
+| FulfillmentStepDefinitionGroup| `Name`                                           | ✅ OK — human-readable |
+| FulfillmentStepDefinition     | `Name`                                           | ✅ OK — all Names unique after consolidation |
+| FulfillmentStepDependencyDef  | `Name`                                           | ✅ OK — all Names unique |
+| ProductFulfillmentScenario    | `Name`                                           | ✅ OK — all Names unique; also has `SourceIdentifier`/`SourceClassIdentifier` as idLookup |
+| FulfillmentWorkspace          | `Name`                                           | ✅ OK — human-readable |
+| FulfillmentTaskAssignmentRule | `Name`                                           | ✅ OK — not auto-num, human-readable |
+
+### Note: ProductFulfillmentDecompRule idLookup Fields
+
+The schema shows `SourceIdentifier`, `DestinationIdentifier`, and `SourceClassIdentifier` as `isIdLookup=true` on ProductFulfillmentDecompRule. These could provide alternative portable matching, but the current `Name` externalId with disambiguated Names is sufficient.
+
+Similarly, `ProductFulfillmentScenario` has `SourceIdentifier` and `SourceClassIdentifier` as `isIdLookup=true`.
+
+## Optimization Opportunities
+
+1. **Fix auto-num Name externalIds**: Replace `Name` on FulfillmentFalloutRule, FulfillmentStepJeopardyRule, ValTfrm, and ProductDecompEnrichmentRule with portable composite keys or human-readable Names
+2. **Add missing 260 fields to SOQL**: Add `RunAsUserId`, `ExecuteOnConditionData`, `ResumeOnConditionData`, `ExecuteOnRuleId` to FulfillmentStepDefinition; `ConditionData`, `UsageType` to FulfillmentTaskAssignmentRule; `ScenarioRuleId` to ProductFulfillmentScenario; `ExecuteOnRuleId` to ProductFulfillmentDecompRule
+3. **Handle polymorphic fields**: Implement `$ObjectType` suffix handling for ExpressionSet/Ruleset/DecisionMatrixDefinition polymorphic targets when these features are used
+4. **IntegrationProviderDef in export.json**: Already present as a `ReadOnly` lookup (4 records, `DeveloperName`) — referenced by FSD/FFR/FSJR
+5. **Extraction available**: Use `extract_qb_dro_data` (Data Management - Extract). Run all extracts: `cci flow run run_qb_extracts --org <org>`. Idempotency: `test_qb_dro_idempotency` / `cci flow run run_qb_idempotency_tests --org <org>`.
+6. **Clean up extra CSVs**: One CSV in the directory is not referenced in `export.json` — `UserAndGroup.csv` (supporting file for dynamic user resolution). Remove it or document it.
+7. **Populate placeholder objects**: Investigate whether ValTfrmGrp, ValTfrm, ProductDecompEnrichmentRule, and FulfillmentTaskAssignmentRule should have data for 260 DRO features
+8. **Review dynamic user resolution**: Ensure the `__DRO_ASSIGNED_TO_USER__` replacement mechanism works correctly in all target org types (scratch, sandbox, production)
+9. **Consistency**: Uses `objectSets` wrapper — consider switching to flat `objects` array if appropriate

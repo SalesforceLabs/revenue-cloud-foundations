@@ -1,0 +1,40 @@
+---
+description: SFDMU v5 export.json editing rules — externalId format, operation selection, deleteOldData safety, object ordering
+globs: **/export.json
+alwaysApply: false
+---
+
+# SFDMU v5 export.json Rules
+
+## DO NOT
+
+- Change `Upsert` to `Insert+deleteOldData` without user approval
+- Use `$$Field1$Field2` in `externalId` (v4 syntax — use `;`)
+- Leave empty CSVs without `excluded: true`
+- Put child objects before parent objects in the `objects` array
+
+## externalId Format
+- Use `;` delimiters: `Field1;Field2` — NOT `$$Field1$Field2` (v4 syntax)
+- Relationship traversals: `Parent.Field` (1-hop), `GrandParent.Parent.Field` (2-hop)
+
+## Operation Selection
+- **Upsert**: the default — works for direct fields AND relationship-traversal externalIds on the **5.6.4+ floor** (Bugs 3/5 fixed)
+- **Insert + deleteOldData: true**: NOT required for traversal externalIds on 5.6.4+ (that was the pre-5.6.4 workaround). Existing plans still carrying it migrate under the gated `sfdmu-v5-optimization` initiative, not ad hoc.
+- **Update**: Modifying existing records only
+- **Readonly**: Reference objects loaded by another plan
+- Never change Upsert → Insert+deleteOldData without a concrete current reason (Bugs 1/2/3/5 are fixed on 5.6.4+ — not valid reasons) and explicit user approval
+
+## v5 Bugs — one live on the 5.6.4 floor
+- Bug 4 (LIVE): `$$` composite notation fails in lookup reference columns (self-referential and cross-object) — use simple single-field references (non-destructive)
+- Bugs 1/2/3/5: FIXED at/below 5.6.4 (the floor). Do not apply their old Insert+deleteOldData/direct-field workarounds — Upsert matches on relationship traversals.
+
+## Object Ordering
+- Parent objects before child objects in the `objects` array
+- deleteOldData objects delete in reverse array order (last first)
+
+## SOQL Queries
+- ORDER BY fields must appear in SELECT
+- Relationship columns must match CSV header expectations
+
+## Empty CSVs
+- Mark `excluded: true` to prevent destructive delete-on-load

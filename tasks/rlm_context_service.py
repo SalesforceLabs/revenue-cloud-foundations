@@ -1,0 +1,1659 @@
+"""
+Manage Context Definitions via Context Service (connect) endpoints.
+
+Supports adding context nodes, mappings, and tags to an existing Context Definition.
+Payloads are supplied via a JSON plan file to keep the task flexible and
+aligned with the Context Service Tooling API contracts.
+"""
+import json
+import os
+from abc import abstractmethod
+from typing import Any, Dict, List, Optional
+
+import requests
+
+from cumulusci.core.keychain import BaseProjectKeychain
+from cumulusci.tasks.sfdx import SFDXBaseTask
+from cumulusci.core.exceptions import TaskOptionsError
+
+_REQUEST_TIMEOUT = 30  # seconds — prevents hangs on slow networks or CI
+
+
+class ManageContextDefinition(SFDXBaseTask):
+    task_options = {
+        "access_token": {
+            "description": "The access token for the org. Defaults to the project default",
+        },
+        "context_definition_id": {
+            "description": "ContextDefinitionId to modify.",
+            "required": False,
+        },
+        "developer_name": {
+            "description": "DeveloperName of the context definition (used to lookup context_definition_id).",
+            "required": False,
+        },
+        "plan_file": {
+            "description": "Path to JSON plan with context-nodes/mappings/tags payloads.",
+            "required": True,
+        },
+        "activate": {
+            "description": "If true, activate the context definition after updates.",
+            "required": False,
+        },
+        "dry_run": {
+            "description": "If true, only logs intended API calls.",
+            "required": False,
+        },
+        "deactivate_before": {
+            "description": "If true, deactivate context definition before updates.",
+            "required": False,
+        },
+        "validate_only": {
+            "description": "If true, only validates the plan against the context definition.",
+            "required": False,
+        },
+        "translate_plan": {
+            "description": "If true, translate mappingRules into contextMappingUpdates.",
+            "required": False,
+        },
+        "verify": {
+            "description": "If true, log verification details after updates.",
+            "required": False,
+        },
+    }
+
+    def _init_options(self, kwargs):
+        super()._init_options(kwargs)
+        self.env = self._get_env()
+
+    def _load_keychain(self):
+        if not hasattr(self, "keychain") or not self.keychain:
+            keychain_class = self.get_keychain_class() or BaseProjectKeychain
+            keychain_key = self.get_keychain_key() if keychain_class.encrypted else None
+            self.keychain = keychain_class(
+                self.project_config or self.universal_config, keychain_key
+            )
+            if self.project_config:
+                self.project_config.keychain = self.keychain
+
+    def _prep_runtime(self):
+        self._load_keychain()
+        self.access_token = self.options.get(
+            "access_token", self.org_config.access_token
+        )
+        self.instance_url = self.options.get(
+            "instance_url", self.org_config.instance_url
+        )
+        self.api_version = self.project_config.project__package__api_version
+
+    def _run_task(self):
+        self._prep_runtime()
+        plan_file = self.options.get("plan_file")
+        if not plan_file or not os.path.isfile(plan_file):
+            raise TaskOptionsError(f"plan_file not found: {plan_file}")
+
+        with open(plan_file, "r", encoding="utf-8") as handle:
+            plan = json.load(handle)
+        if not isinstance(plan, dict):
+            raise TaskOptionsError("plan_file must contain a JSON object")
+
+        if isinstance(plan.get("contexts"), list):
+            for context_plan in plan["contexts"]:
+                if not isinstance(context_plan, dict):
+                    raise TaskOptionsError("Each contexts entry must be an object")
+                if "planFile" in context_plan:
+                    plan_path = os.path.join(os.path.dirname(plan_file), context_plan["planFile"])
+                    with open(plan_path, "r", encoding="utf-8") as nested:
+                        nested_plan = json.load(nested)
+                    if not isinstance(nested_plan, dict):
+                        raise TaskOptionsError(f"planFile must contain a JSON object: {plan_path}")
+                    merged = {**nested_plan, **context_plan}
+                    self._run_plan_for_context(merged)
+                else:
+                    self._run_plan_for_context(context_plan)
+            return
+
+        self._run_plan_for_context(plan)
+
+    def _run_plan_for_context(self, plan: Dict[str, Any]):
+        context_id = self.options.get("context_definition_id") or plan.get("contextDefinitionId")
+        developer_name = self.options.get("developer_name") or plan.get("developerName")
+        if not context_id:
+            if not developer_name:
+                raise TaskOptionsError("context_definition_id or developer_name is required")
+            context_id = self._resolve_context_definition_id(developer_name)
+            if not context_id:
+                create = str(plan.get("create", "false")).lower() in {"1", "true", "yes"}
+                validate_only = str(self.options.get("validate_only", "")).lower() in {"1", "true", "yes"}
+                if create:
+                    if validate_only:
+                        # No existing definition to validate against — log and skip creation.
+                        self.logger.info(
+                            "validate_only=true: context definition '%s' does not exist; skipping creation.",
+                            developer_name,
+                        )
+                        return
+                    dry_run = str(self.options.get("dry_run", "")).lower() in {"1", "true", "yes"}
+                    activate = str(self.options.get("activate", plan.get("activate", ""))).lower() in {"1", "true", "yes"}
+                    verify = str(self.options.get("verify", "")).lower() in {"1", "true", "yes"}
+                    context_id = self._create_context_definition_record(plan, dry_run)
+                    if not context_id and not dry_run:
+                        raise TaskOptionsError(f"Failed to create context definition: {developer_name}")
+                    self.logger.info("Created ContextDefinitionId: %s", context_id or "dry-run")
+                    self._run_create_flow(context_id or "dry-run-id", developer_name, plan, dry_run, activate, verify)
+                    return
+                raise TaskOptionsError(f"Unable to resolve context definition for {developer_name}. Set 'create: true' in the plan to create it.")
+
+        self.logger.info(f"Using ContextDefinitionId: {context_id}")
+
+        dry_run = str(self.options.get("dry_run", "")).lower() in {"1", "true", "yes"}
+        validate_only = str(self.options.get("validate_only", "")).lower() in {"1", "true", "yes"}
+        translate_plan = str(self.options.get("translate_plan", "true")).lower() in {"1", "true", "yes"}
+        activate = str(self.options.get("activate", plan.get("activate", ""))).lower() in {"1", "true", "yes"}
+        verify = str(self.options.get("verify", "")).lower() in {"1", "true", "yes"}
+
+        self._validate_plan(context_id, plan)
+        if validate_only:
+            self.logger.info("Validation only; skipping API updates.")
+            return
+
+        deactivate_before = str(self.options.get("deactivate_before", plan.get("deactivateBefore", "false"))).lower() in {"1", "true", "yes"}
+        if deactivate_before and self._is_context_active(context_id):
+            self._set_context_active(context_id, False, dry_run)
+
+        # Snapshot before changes; re-fetch after mutations for accurate verification.
+        detail = self._fetch_context_definition(context_id)
+
+        # Create nodes from contextNodeDefinitions if present (supports updating a definition
+        # that was created empty or needs new nodes added). Must run before attributes and
+        # mapping rules, which require nodes to already exist.
+        # Filter out nodes that already exist so re-runs are idempotent.
+        if plan.get("contextNodeDefinitions"):
+            existing_names = self._collect_node_names(detail)
+            new_node_defs = [
+                nd for nd in plan["contextNodeDefinitions"]
+                if isinstance(nd, dict) and nd.get("name") not in existing_names
+            ]
+            if new_node_defs:
+                self._create_context_nodes_hierarchical(context_id, new_node_defs, dry_run, existing_detail=detail)
+                detail = self._fetch_context_definition(context_id)
+
+        # Create mapping entities before attributes so translate_plan mapping rules can resolve IDs.
+        if plan.get("contextMappings"):
+            filtered = self._filter_existing_mappings(context_id, plan["contextMappings"])
+            if filtered:
+                self._post_context_mappings(context_id, filtered, dry_run)
+            detail = self._fetch_context_definition(context_id)
+
+        if plan.get("contextAttributesByName"):
+            resolved_attrs = self._resolve_context_attributes_by_name(context_id, plan["contextAttributesByName"])
+            if resolved_attrs:
+                self._post_context_attributes(context_id, {"contextAttributes": resolved_attrs}, dry_run)
+                detail = self._fetch_context_definition(context_id)
+            if self._sync_context_attribute_properties(context_id, plan["contextAttributesByName"], dry_run):
+                detail = self._fetch_context_definition(context_id)
+
+        if translate_plan and plan.get("mappingRules"):
+            if not isinstance(detail, dict):
+                detail = {}
+            # Apply SOBJECT mappings first so context-to-context mapping can reference the new ids.
+            rules = plan.get("mappingRules") or []
+            sobject_rules = []
+            context_rules = []
+            for rule in rules:
+                if not isinstance(rule, dict):
+                    continue
+                if (rule.get("mappingType") or "SOBJECT").upper() == "CONTEXT":
+                    context_rules.append(rule)
+                else:
+                    sobject_rules.append(rule)
+
+            if sobject_rules:
+                # Exclude traversal rules from the Connect API PATCH — the PATCH wipes existing
+                # hydration details on re-runs. Traversal rules are handled by _apply_traversal_hydration.
+                traversal_rules = [r for r in sobject_rules if isinstance(r, dict) and r.get("childSObjectField")]
+                patch_rules = [r for r in sobject_rules if not (isinstance(r, dict) and r.get("childSObjectField"))]
+                if patch_rules:
+                    translated = self._translate_mapping_rules(patch_rules, detail)
+                    if translated:
+                        resolved_updates = self._resolve_context_mapping_ids(detail, translated)
+                        if resolved_updates:
+                            self._apply_context_mapping_updates(context_id, resolved_updates, dry_run)
+                            detail = self._fetch_context_definition(context_id)
+                if traversal_rules:
+                    self._apply_traversal_hydration(traversal_rules, detail, dry_run)
+
+            if context_rules:
+                translated = self._translate_mapping_rules(context_rules, detail, developer_name=developer_name)
+                if translated:
+                    resolved_updates = self._resolve_context_mapping_ids(detail, translated)
+                    if resolved_updates:
+                        self._apply_context_mapping_updates(context_id, resolved_updates, dry_run)
+                        detail = self._fetch_context_definition(context_id)
+
+        if plan.get("contextMappingUpdates"):
+            resolved_updates = self._resolve_context_mapping_ids(detail, plan["contextMappingUpdates"])
+            if resolved_updates:
+                plan["contextMappingUpdates"] = resolved_updates
+
+        if plan.get("contextNodes"):
+            self._post_context_nodes(context_id, plan["contextNodes"], dry_run)
+        # contextMappings already handled above (before attributes) to ensure
+        # mapping IDs are available for translate_plan mapping rules; skip here.
+        if plan.get("contextMappingUpdates"):
+            self._apply_context_mapping_updates(context_id, plan["contextMappingUpdates"], dry_run)
+        if plan.get("contextTagsByName"):
+            resolved = self._resolve_tags_by_name(context_id, plan["contextTagsByName"])
+            if resolved:
+                self._post_context_tags(context_id, {"contextTags": resolved}, dry_run)
+        if plan.get("contextTags"):
+            self._post_context_tags(context_id, plan["contextTags"], dry_run)
+
+        if verify:
+            detail = self._fetch_context_definition(context_id)
+            self._log_verification(detail, plan)
+
+        if activate:
+            self._activate_context_definition(context_id, dry_run)
+
+    def _create_context_definition_record(self, plan: Dict[str, Any], dry_run: bool) -> Optional[str]:
+        """POST to connect/context-definitions to create a new context definition.
+
+        Required plan fields: developerName, label (or name).
+        Optional plan fields: startDate, contextTtl, description.
+        Use 'createPayload' in the plan to pass additional/override fields directly.
+        """
+        url, headers = self._build_url_and_headers("connect/context-definitions")
+        raw_name = plan.get("label") or plan.get("name") or plan.get("developerName") or ""
+        # The name field must be alphanumeric only (API rejects spaces and special chars).
+        api_name = "".join(c for c in raw_name if c.isalnum())
+        payload: Dict[str, Any] = {
+            "name": api_name,
+            "developerName": plan.get("developerName"),
+        }
+        # 'primaryDomainObject' is not accepted by the context-definitions create endpoint
+        # (returns JSON_PARSER_ERROR). Omit it; the API does not require it for create.
+        for field in ("description", "startDate", "contextTtl", "baseReference",
+                      "contextType"):
+            if plan.get(field) is not None:
+                payload[field] = plan[field]
+        if isinstance(plan.get("createPayload"), dict):
+            payload.update(plan["createPayload"])
+        self.logger.info("Creating context definition: %s", payload.get("developerName"))
+        response = self._make_request("post", url, headers=headers, json=payload, dry_run=dry_run)
+        if isinstance(response, dict):
+            ctx_id = response.get("contextDefinitionId") or response.get("id")
+            if ctx_id:
+                return ctx_id
+            self.logger.warning("Create response missing contextDefinitionId: %s", response)
+        return None
+
+    def _run_create_flow(
+        self,
+        context_id: str,
+        developer_name: Optional[str],
+        plan: Dict[str, Any],
+        dry_run: bool,
+        activate: bool,
+        verify: bool,
+    ):
+        """Ordered setup flow for a newly created context definition.
+
+        Creates nodes → creates mapping entities → re-fetches → posts attributes
+        → applies mapping rules → posts tags → activates.
+        This ordering ensures IDs are available at each step.
+        """
+        translate_plan = str(self.options.get("translate_plan", "true")).lower() in {"1", "true", "yes"}
+
+        # 1. Create nodes. contextNodeDefinitions supports an optional 'parentNodeName' reference
+        #    so parent nodes can be specified before child nodes in the list.
+        node_defs = plan.get("contextNodeDefinitions")
+        if node_defs:
+            self._create_context_nodes_hierarchical(context_id, node_defs, dry_run)
+        elif plan.get("contextNodes"):
+            self._post_context_nodes(context_id, plan["contextNodes"], dry_run)
+
+        # 2. Create context mapping entities.
+        if plan.get("contextMappings"):
+            filtered = self._filter_existing_mappings(context_id, plan["contextMappings"])
+            if filtered:
+                self._post_context_mappings(context_id, filtered, dry_run)
+
+        # 3. Re-fetch so subsequent steps have node/mapping/attribute IDs.
+        # In dry_run the context doesn't exist in the org — skip network calls.
+        if dry_run:
+            return
+        detail = self._fetch_context_definition(context_id)
+
+        # 4. Post attributes by name (nodes now exist in the org).
+        if plan.get("contextAttributesByName"):
+            resolved_attrs = self._resolve_context_attributes_by_name(context_id, plan["contextAttributesByName"])
+            if resolved_attrs:
+                self._post_context_attributes(context_id, {"contextAttributes": resolved_attrs}, dry_run)
+                detail = self._fetch_context_definition(context_id)
+            if self._sync_context_attribute_properties(context_id, plan["contextAttributesByName"], dry_run):
+                detail = self._fetch_context_definition(context_id)
+
+        # 5. Apply mapping rules (all IDs now available).
+        if translate_plan and plan.get("mappingRules"):
+            rules = plan.get("mappingRules", [])
+            sobject_rules = [r for r in rules if isinstance(r, dict) and (r.get("mappingType") or "SOBJECT").upper() != "CONTEXT"]
+            context_rules = [r for r in rules if isinstance(r, dict) and (r.get("mappingType") or "SOBJECT").upper() == "CONTEXT"]
+            if sobject_rules:
+                translated = self._translate_mapping_rules(sobject_rules, detail)
+                if translated:
+                    resolved = self._resolve_context_mapping_ids(detail, translated)
+                    if resolved:
+                        self._apply_context_mapping_updates(context_id, resolved, dry_run)
+                        detail = self._fetch_context_definition(context_id)
+            if context_rules:
+                translated = self._translate_mapping_rules(context_rules, detail, developer_name=developer_name)
+                if translated:
+                    resolved = self._resolve_context_mapping_ids(detail, translated)
+                    if resolved:
+                        self._apply_context_mapping_updates(context_id, resolved, dry_run)
+                        detail = self._fetch_context_definition(context_id)
+
+        # Also handle explicit contextMappingUpdates if specified.
+        if plan.get("contextMappingUpdates"):
+            resolved_updates = self._resolve_context_mapping_ids(detail, plan["contextMappingUpdates"])
+            if resolved_updates:
+                self._apply_context_mapping_updates(context_id, resolved_updates, dry_run)
+
+        # 6. Post tags.
+        if plan.get("contextTagsByName"):
+            resolved = self._resolve_tags_by_name(context_id, plan["contextTagsByName"])
+            if resolved:
+                self._post_context_tags(context_id, {"contextTags": resolved}, dry_run)
+        if plan.get("contextTags"):
+            self._post_context_tags(context_id, plan["contextTags"], dry_run)
+
+        # 7. Verify.
+        if verify:
+            detail = self._fetch_context_definition(context_id)
+            self._log_verification(detail, plan)
+
+        # 8. Activate.
+        if activate:
+            self._activate_context_definition(context_id, dry_run)
+
+    def _create_context_nodes_hierarchical(
+        self, context_id: str, node_defs: list, dry_run: bool, existing_detail: Optional[Dict[str, Any]] = None
+    ):
+        """Create context nodes one at a time, resolving parentNodeName references.
+
+        Each node_def may contain 'parentNodeName' (a reference to a previously
+        created node's name). The node ID captured from the creation response is
+        used as 'parentNodeId' for subsequent child nodes.
+
+        Pass ``existing_detail`` (a fetched context definition response) to pre-populate
+        the name→ID map from already-existing nodes so child nodes can be correctly
+        parented to nodes that were created in a previous run.
+        """
+        node_id_by_name: Dict[str, str] = {}
+        # Pre-populate from existing nodes so parentNodeName references work when adding
+        # child nodes beneath parents that already exist in the context definition.
+        if existing_detail and not dry_run:
+            versions = existing_detail.get("contextDefinitionVersionList", []) if isinstance(existing_detail, dict) else []
+            nodes = versions[0].get("contextNodes", []) if versions else []
+
+            def _index_nodes(node_list):
+                for node in node_list or []:
+                    if not isinstance(node, dict):
+                        continue
+                    name = node.get("name")
+                    nid = node.get("contextNodeId")
+                    if name and nid:
+                        node_id_by_name[name] = nid
+                    child_container = node.get("childNodes", {})
+                    children = (
+                        child_container.get("contextNodes", [])
+                        if isinstance(child_container, dict)
+                        else (child_container or [])
+                    )
+                    _index_nodes(children)
+
+            _index_nodes(nodes)
+        url, headers = self._build_url_and_headers(
+            f"connect/context-definitions/{context_id}/context-nodes"
+        )
+        for node_def in node_defs:
+            if not isinstance(node_def, dict):
+                continue
+            node_name = node_def.get("name")
+            if not node_name:
+                raise TaskOptionsError(
+                    f"contextNodeDefinitions entry is missing required 'name': {node_def}"
+                )
+            parent_name = node_def.get("parentNodeName")
+            # Only pass fields the context-nodes API accepts; label is not a valid field.
+            node_payload = {"name": node_name}
+            if parent_name:
+                parent_id = node_id_by_name.get(parent_name)
+                if parent_id:
+                    node_payload["parentNodeId"] = parent_id
+                else:
+                    self.logger.warning(
+                        "Parent node '%s' not yet created for '%s'; skipping parent link.",
+                        parent_name, node_name,
+                    )
+            self.logger.info("Creating context node: %s", node_name)
+            response = self._make_request(
+                "post", url, headers=headers,
+                json={"contextNodes": [node_payload]}, dry_run=dry_run,
+            )
+            # Capture node ID from response for child-node parent references.
+            if isinstance(response, dict) and node_name:
+                created = response.get("contextNodes", [])
+                if created and isinstance(created[0], dict):
+                    node_id = created[0].get("contextNodeId")
+                    if node_id:
+                        node_id_by_name[node_name] = node_id
+                        continue
+                # Fallback: re-fetch the definition to find the node ID.
+                if not dry_run:
+                    detail = self._fetch_context_definition(context_id)
+
+                    def _find_node_id(nodes, name):
+                        for n in nodes or []:
+                            if not isinstance(n, dict):
+                                continue
+                            if n.get("name") == name:
+                                return n.get("contextNodeId")
+                            child_container = n.get("childNodes", {})
+                            children = child_container.get("contextNodes", []) if isinstance(child_container, dict) else (child_container or [])
+                            found = _find_node_id(children, name)
+                            if found:
+                                return found
+                        return None
+
+                    versions = detail.get("contextDefinitionVersionList", [])
+                    top_nodes = versions[0].get("contextNodes", []) if versions else []
+                    node_id = _find_node_id(top_nodes, node_name)
+                    if node_id:
+                        node_id_by_name[node_name] = node_id
+
+    def _build_url_and_headers(self, endpoint: str):
+        url = f"{self.instance_url}/services/data/v{self.api_version}/{endpoint}"
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
+        }
+        return url, headers
+
+    def _make_request(self, method, url, dry_run=False, **kwargs) -> Optional[Dict[str, Any]]:
+        if dry_run:
+            self.logger.info(f"[dry-run] {method.upper()} {url} {kwargs.get('json')}")
+            return {}
+        kwargs.setdefault("timeout", _REQUEST_TIMEOUT)
+        response = requests.request(method, url, **kwargs)
+        if response.ok:
+            if response.text:
+                return response.json()
+            return {}
+        self.logger.error(f"Failed {method.upper()} request to {url}: {response.text}")
+        return None
+
+    def _resolve_context_definition_id(self, developer_name: str) -> Optional[str]:
+        url, headers = self._build_url_and_headers("connect/context-definitions")
+        response = self._make_request("get", url, headers=headers)
+        if not response:
+            return self._resolve_context_definition_id_fallback(developer_name)
+        if isinstance(response, list):
+            self.logger.warning("Unexpected list response for context definitions; cannot resolve by name.")
+            return self._resolve_context_definition_id_fallback(developer_name)
+        for item in response.get("contextDefinitionList", []):
+            if item.get("developerName") == developer_name:
+                return item.get("contextDefinitionId")
+        return self._resolve_context_definition_id_fallback(developer_name)
+
+    def _resolve_context_definition_id_fallback(self, developer_name: str) -> Optional[str]:
+        url, headers = self._build_url_and_headers(f"connect/context-definitions/{developer_name}")
+        response = self._make_request("get", url, headers=headers)
+        # The API returns a stub dict with isSuccess:false for unknown definitions;
+        # treat that as "not found" to avoid using the developer name as a false ID.
+        if isinstance(response, dict) and response.get("isSuccess") is not False:
+            return response.get("contextDefinitionId")
+        return None
+
+    def _post_context_nodes(self, context_id: str, payload: Dict[str, Any], dry_run: bool):
+        url, headers = self._build_url_and_headers(
+            f"connect/context-definitions/{context_id}/context-nodes"
+        )
+        self._make_request("post", url, headers=headers, json=payload, dry_run=dry_run)
+
+    def _post_context_mappings(self, context_id: str, payload: Dict[str, Any], dry_run: bool):
+        url, headers = self._build_url_and_headers(
+            f"connect/context-definitions/{context_id}/context-mappings"
+        )
+        self._make_request("post", url, headers=headers, json=payload, dry_run=dry_run)
+
+    def _post_context_tags(self, context_id: str, payload: Dict[str, Any], dry_run: bool):
+        url, headers = self._build_url_and_headers(
+            f"connect/context-definitions/{context_id}/context-tags"
+        )
+        self._make_request("post", url, headers=headers, json=payload, dry_run=dry_run)
+
+    def _post_context_attributes(self, context_id: str, payload: Dict[str, Any], dry_run: bool):
+        if not isinstance(payload, dict):
+            return
+        attributes = payload.get("contextAttributes") or []
+        if not isinstance(attributes, list):
+            return
+
+        by_node = {}
+        for attr in attributes:
+            if not isinstance(attr, dict):
+                continue
+            node_id = attr.get("contextNodeId")
+            if not node_id:
+                continue
+            by_node.setdefault(node_id, []).append(
+                {k: v for k, v in attr.items() if k != "contextNodeId"}
+            )
+
+        for node_id, attrs in by_node.items():
+            url, headers = self._build_url_and_headers(
+                f"connect/context-nodes/{node_id}/context-attributes"
+            )
+            self._make_request(
+                "post",
+                url,
+                headers=headers,
+                json={"contextAttributes": attrs},
+                dry_run=dry_run,
+            )
+
+    def _patch_context_mappings(self, context_id: str, payload: Dict[str, Any], dry_run: bool):
+        url, headers = self._build_url_and_headers(
+            f"connect/context-definitions/{context_id}/context-mappings"
+        )
+        def strip_none(value):
+            if isinstance(value, dict):
+                cleaned = {k: strip_none(v) for k, v in value.items() if v is not None}
+                return {k: v for k, v in cleaned.items() if v is not None}
+            if isinstance(value, list):
+                return [strip_none(v) for v in value if v is not None]
+            return value
+
+        if isinstance(payload, dict) and isinstance(payload.get("contextMappings"), list):
+            for mapping in payload["contextMappings"]:
+                if not isinstance(mapping, dict):
+                    continue
+                mapping.pop("name", None)
+                self._make_request(
+                    "patch",
+                    url,
+                    headers=headers,
+                    json={"contextMappings": [strip_none(mapping)]},
+                    dry_run=dry_run,
+                )
+            return
+        if isinstance(payload, dict):
+            payload.pop("name", None)
+        self._make_request(
+            "patch",
+            url,
+            headers=headers,
+            json={"contextMappings": [strip_none(payload)]},
+            dry_run=dry_run,
+        )
+
+    def _post_context_node_mappings(self, context_mapping_id: str, node_mappings: list, dry_run: bool):
+        url, headers = self._build_url_and_headers(
+            f"connect/context-mappings/{context_mapping_id}/context-node-mappings"
+        )
+        self.logger.info(
+            "Posting %s context node mapping(s) to %s",
+            len(node_mappings),
+            context_mapping_id,
+        )
+        self._make_request(
+            "post",
+            url,
+            headers=headers,
+            json={"contextNodeMappings": node_mappings},
+            dry_run=dry_run,
+        )
+
+    def _patch_context_node_mappings(self, context_mapping_id: str, node_mappings: list, dry_run: bool):
+        url, headers = self._build_url_and_headers(
+            f"connect/context-mappings/{context_mapping_id}/context-node-mappings"
+        )
+        self.logger.info(
+            "Patching %s context node mapping(s) to %s",
+            len(node_mappings),
+            context_mapping_id,
+        )
+        self._make_request(
+            "patch",
+            url,
+            headers=headers,
+            json={"contextNodeMappings": node_mappings},
+            dry_run=dry_run,
+        )
+
+    def _normalize_attribute_mappings(self, node_map: Dict[str, Any]):
+        if not isinstance(node_map, dict):
+            return node_map
+        attribute_mappings = node_map.get("attributeMappings")
+        if isinstance(attribute_mappings, list):
+            node_map = {**node_map, "attributeMappings": {"contextAttributeMappings": attribute_mappings}}
+        return node_map
+
+    def _apply_context_mapping_updates(self, context_id: str, payload: Dict[str, Any], dry_run: bool):
+        if not isinstance(payload, dict):
+            return
+        mappings = payload.get("contextMappings")
+        if not isinstance(mappings, list):
+            return
+
+        # Split mapping updates: node mappings handled via context-node-mappings endpoint.
+        remaining = []
+        for mapping in mappings:
+            if not isinstance(mapping, dict):
+                continue
+            context_mapping_id = mapping.get("contextMappingId")
+            node_maps = mapping.get("contextNodeMappings")
+            if context_mapping_id and node_maps:
+                if isinstance(node_maps, dict):
+                    node_maps = node_maps.get("contextNodeMappings", [])
+                normalized = []
+                for node_map in node_maps or []:
+                    node_map = self._normalize_attribute_mappings(node_map)
+                    if not isinstance(node_map, dict):
+                        continue
+                    normalized.append(node_map)
+                if normalized:
+                    self.logger.info(
+                        "Applying %s node mapping(s) for mappingId=%s",
+                        len(normalized),
+                        context_mapping_id,
+                    )
+                    # POST if no ids; PATCH if ids provided.
+                    if any(m.get("contextNodeMappingId") for m in normalized):
+                        self._patch_context_node_mappings(context_mapping_id, normalized, dry_run)
+                    else:
+                        self._post_context_node_mappings(context_mapping_id, normalized, dry_run)
+                # If the mapping carries mappedContextDefinitionName (CONTEXT-type mapping
+                # source), set it via the ContextNodeMapping sObject REST API. The Connect
+                # API context-mappings PATCH silently ignores this field.
+                mapped_ctx_def = mapping.get("mappedContextDefinitionName")
+                if mapped_ctx_def:
+                    for nm in normalized:
+                        node_mapping_id = nm.get("contextNodeMappingId")
+                        if node_mapping_id:
+                            self._set_mapped_context_definition(node_mapping_id, mapped_ctx_def, dry_run)
+                continue
+            remaining.append(mapping)
+
+        if remaining:
+            self._patch_context_mappings(context_id, {"contextMappings": remaining}, dry_run)
+
+    def _resolve_context_mapping_ids(self, detail: Dict[str, Any], payload: Dict[str, Any]):
+        if not isinstance(payload, dict):
+            return payload
+        mappings = payload.get("contextMappings")
+        if not isinstance(mappings, list):
+            return payload
+        if not isinstance(detail, dict):
+            return payload
+        versions = detail.get("contextDefinitionVersionList", [])
+        mapping_list = versions[0].get("contextMappings", []) if versions else []
+        index = {m.get("name"): m for m in mapping_list if isinstance(m, dict) and m.get("name")}
+        changed = False
+        resolved = []
+        for mapping in mappings:
+            if not isinstance(mapping, dict):
+                resolved.append(mapping)
+                continue
+            if not mapping.get("contextMappingId") and mapping.get("name") in index:
+                mapping = {**mapping, "contextMappingId": index[mapping["name"]].get("contextMappingId")}
+                changed = True
+            resolved.append(mapping)
+        if not changed:
+            return payload
+        return {**payload, "contextMappings": resolved}
+
+    def _fetch_context_definition(self, context_id: str) -> Dict[str, Any]:
+        url, headers = self._build_url_and_headers(
+            f"connect/context-definitions/{context_id}"
+        )
+        response = self._make_request("get", url, headers=headers)
+        if isinstance(response, list):
+            if len(response) == 1 and isinstance(response[0], dict):
+                return response[0]
+            self.logger.warning("Unexpected list response for context definition; skipping validation.")
+            return {}
+        return response or {}
+
+    def _set_mapped_context_definition(self, node_mapping_id: str, developer_name: str, dry_run: bool = False):
+        """Set MappedContextDefinition on a ContextNodeMapping sObject record.
+
+        The Connect API context-mappings PATCH silently ignores mappedContextDefinitionName,
+        so we update the sObject directly via the REST API.
+        """
+        url, headers = self._build_url_and_headers(
+            f"sobjects/ContextNodeMapping/{node_mapping_id}"
+        )
+        payload = {"MappedContextDefinition": developer_name}
+        self.logger.info(
+            "Setting MappedContextDefinition=%s on ContextNodeMapping %s",
+            developer_name,
+            node_mapping_id,
+        )
+        self._make_request("patch", url, headers=headers, json=payload, dry_run=dry_run)
+
+    def _apply_traversal_hydration(
+        self, rules: List[Dict[str, Any]], detail: Dict[str, Any], dry_run: bool
+    ) -> None:
+        """Create ContextAttributeMapping + ContextAttrHydrationDetail for relationship-traversal
+        mapping rules entirely via the SObject REST API.
+
+        The Connect API PATCH rejects relationship traversals (INSUFFICIENT_ACCESS) and also
+        wipes existing hydration details when traversal rules are sent without hydrationDetails.
+        Bypassing PATCH entirely for these rules makes re-runs idempotent: if the
+        ContextAttributeMapping already has hydration details, we skip without touching anything.
+
+        Two chained ContextAttrHydrationDetail records are created per rule:
+          parent: source SObject + relationship field (e.g. Quote.Account)
+          child:  target SObject + field, linked via ParentHydrationDetailId (e.g. Account.Name)
+        """
+        # Build indexes needed to create ContextAttributeMapping records.
+        versions = detail.get("contextDefinitionVersionList", []) if isinstance(detail, dict) else []
+        mappings = versions[0].get("contextMappings", []) if versions else []
+
+        # node_mapping_id_index: (mapping_name, node_name) → contextNodeMappingId
+        node_mapping_id_index: Dict[tuple, str] = {}
+        for mapping in mappings or []:
+            if not isinstance(mapping, dict):
+                continue
+            m_name = mapping.get("name") or mapping.get("title")
+            for node_map in mapping.get("contextNodeMappings", []) or []:
+                if not isinstance(node_map, dict):
+                    continue
+                n_name = node_map.get("contextNodeName")
+                n_map_id = node_map.get("contextNodeMappingId")
+                if m_name and n_name and n_map_id:
+                    node_mapping_id_index[(m_name, n_name)] = n_map_id
+
+        _, attr_index = self._collect_context_indexes(detail, {})
+
+        for rule in rules:
+            attr_name = rule.get("contextAttribute")
+            mapping_name = rule.get("mappingName")
+            node_name = rule.get("contextNode")
+            s_object = rule.get("sObject")
+            s_object_field = rule.get("sObjectField")
+            child_s_object = rule.get("childSObject")
+            child_s_object_field = rule.get("childSObjectField")
+            if not all([attr_name, mapping_name, node_name, s_object, s_object_field, child_s_object, child_s_object_field]):
+                continue
+
+            # Query existing ContextAttributeMapping records for this attribute.
+            soql = (
+                f"SELECT Id,CreatedDate FROM ContextAttributeMapping "
+                f"WHERE ContextInputAttributeName='{attr_name}' ORDER BY CreatedDate DESC"
+            )
+            q_url, headers = self._build_url_and_headers("query")
+            resp = self._make_request("get", q_url, headers=headers, params={"q": soql}, dry_run=False)
+            existing_mappings = resp.get("records", []) if isinstance(resp, dict) else []
+
+            if existing_mappings:
+                keeper_id = existing_mappings[0]["Id"]
+            else:
+                # No ContextAttributeMapping yet — create one via SObject API.
+                node_mapping_id = node_mapping_id_index.get((mapping_name, node_name))
+                attr_id = attr_index.get((node_name, attr_name))
+                if not node_mapping_id or not attr_id:
+                    self.logger.warning(
+                        "Cannot create ContextAttributeMapping for %s: node_mapping_id=%s attr_id=%s",
+                        attr_name, node_mapping_id, attr_id,
+                    )
+                    continue
+                cam_url, cam_headers = self._build_url_and_headers("sobjects/ContextAttributeMapping")
+                cam_resp = self._make_request(
+                    "post", cam_url, headers=cam_headers,
+                    json={
+                        "ContextNodeMappingId": node_mapping_id,
+                        "ContextAttributeId": attr_id,
+                        "ContextInputAttributeName": attr_name,
+                    },
+                    dry_run=dry_run,
+                )
+                if dry_run:
+                    continue
+                keeper_id = (cam_resp or {}).get("id") or (cam_resp or {}).get("Id") if isinstance(cam_resp, dict) else None
+                if not keeper_id:
+                    self.logger.warning("Failed to create ContextAttributeMapping for %s", attr_name)
+                    continue
+
+            # Check if hydration already exists (idempotent) — skip if so.
+            # The platform may auto-create hydration entries when the ContextAttributeMapping
+            # is created, so check even for newly created mappings.
+            hd_soql = (
+                f"SELECT Id FROM ContextAttrHydrationDetail "
+                f"WHERE ContextAttributeMappingId='{keeper_id}'"
+            )
+            hd_resp = self._make_request("get", q_url, headers=headers, params={"q": hd_soql}, dry_run=False)
+            if (hd_resp or {}).get("records"):
+                self.logger.info(
+                    "Traversal hydration already exists for %s; skipping", attr_name
+                )
+                continue
+
+            # Insert parent + child ContextAttrHydrationDetail records.
+            hd_url, hd_headers = self._build_url_and_headers("sobjects/ContextAttrHydrationDetail")
+            self.logger.info(
+                "Creating traversal hydration for %s: %s.%s → %s.%s",
+                attr_name, s_object, s_object_field, child_s_object, child_s_object_field,
+            )
+            parent_resp = self._make_request(
+                "post", hd_url, headers=hd_headers,
+                json={"ContextAttributeMappingId": keeper_id, "ObjectName": s_object, "QueryAttribute": s_object_field},
+                dry_run=dry_run,
+            )
+            if dry_run:
+                continue
+            parent_id = (parent_resp or {}).get("id") or (parent_resp or {}).get("Id") if isinstance(parent_resp, dict) else None
+            if not parent_id:
+                self.logger.warning("Failed to get parent hydration detail ID for %s", attr_name)
+                continue
+            self._make_request(
+                "post", hd_url, headers=hd_headers,
+                json={
+                    "ContextAttributeMappingId": keeper_id,
+                    "ObjectName": child_s_object,
+                    "QueryAttribute": child_s_object_field,
+                    "ParentHydrationDetailId": parent_id,
+                },
+                dry_run=dry_run,
+            )
+
+    def _is_context_active(self, context_id: str) -> bool:
+        detail = self._fetch_context_definition(context_id)
+        if not isinstance(detail, dict):
+            return False
+        if detail.get("isActive") is not None or detail.get("active") is not None:
+            return bool(detail.get("isActive") or detail.get("active"))
+        versions = detail.get("contextDefinitionVersionList", [])
+        if versions and isinstance(versions[0], dict):
+            return bool(versions[0].get("isActive"))
+        return False
+
+    def _set_context_active(self, context_id: str, is_active: bool, dry_run: bool):
+        url, headers = self._build_url_and_headers(
+            f"connect/context-definitions/{context_id}"
+        )
+        payload = {"isActive": "true" if is_active else "false"}
+        self._make_request("patch", url, headers=headers, json=payload, dry_run=dry_run)
+
+    def _collect_context_indexes(self, detail: Dict[str, Any], plan: Dict[str, Any]):
+        if not isinstance(detail, dict):
+            return {}, {}
+        versions = detail.get("contextDefinitionVersionList", [])
+        mappings = versions[0].get("contextMappings", []) if versions else []
+
+        node_index = {}
+        attr_index = {}
+
+        for mapping in mappings or []:
+            if not isinstance(mapping, dict):
+                continue
+            for node_map in mapping.get("contextNodeMappings", []):
+                if not isinstance(node_map, dict):
+                    continue
+                node_name = node_map.get("contextNodeName")
+                node_id = node_map.get("contextNodeId")
+                if node_name:
+                    node_index[node_name] = node_id
+                for attr in node_map.get("attributeMappings", []) or []:
+                    if not isinstance(attr, dict):
+                        continue
+                    attr_name = attr.get("contextAttributeName")
+                    attr_id = attr.get("contextAttributeId")
+                    if node_name and attr_name:
+                        attr_index[(node_name, attr_name)] = attr_id
+
+        context_nodes = versions[0].get("contextNodes", []) if versions else []
+
+        def walk(nodes):
+            for node in nodes or []:
+                if not isinstance(node, dict):
+                    continue
+                node_id = node.get("contextNodeId")
+                node_name = node.get("name")
+                if node_name and node_id:
+                    node_index.setdefault(node_name, node_id)
+                attrs_container = node.get("attributes", {})
+                if isinstance(attrs_container, list):
+                    attrs = attrs_container
+                else:
+                    if not isinstance(attrs_container, dict):
+                        attrs_container = {}
+                    attrs = attrs_container.get("contextAttributes", [])
+                for attr in attrs or []:
+                    if not isinstance(attr, dict):
+                        continue
+                    attr_name = attr.get("name")
+                    attr_id = attr.get("contextAttributeId")
+                    if node_name and attr_name and attr_id:
+                        attr_index.setdefault((node_name, attr_name), attr_id)
+                child_nodes_container = node.get("childNodes", {})
+                if isinstance(child_nodes_container, list):
+                    child_nodes = child_nodes_container
+                else:
+                    if not isinstance(child_nodes_container, dict):
+                        child_nodes_container = {}
+                    child_nodes = child_nodes_container.get("contextNodes", [])
+                walk(child_nodes)
+
+        walk(context_nodes)
+
+        # Include attributes from plan contextNodes so validation passes for newly added attributes.
+        plan_nodes = plan.get("contextNodes")
+        if isinstance(plan_nodes, dict):
+            plan_nodes_list = plan_nodes.get("contextNodes", [])
+        else:
+            plan_nodes_list = []
+        for node in plan_nodes_list:
+            node_name = node.get("name")
+            if node_name:
+                node_index.setdefault(node_name, None)
+            attrs_container = node.get("attributes", {})
+            if isinstance(attrs_container, list):
+                attrs = attrs_container
+            else:
+                if not isinstance(attrs_container, dict):
+                    attrs_container = {}
+                attrs = attrs_container.get("contextAttributes", [])
+            for attr in attrs:
+                attr_name = attr.get("name")
+                if node_name and attr_name:
+                    attr_index.setdefault((node_name, attr_name), None)
+
+        for attr in plan.get("contextAttributesByName", []) or []:
+            if not isinstance(attr, dict):
+                continue
+            node_name = attr.get("nodeName")
+            attr_name = attr.get("name")
+            if node_name and attr_name:
+                node_index.setdefault(node_name, None)
+                attr_index.setdefault((node_name, attr_name), None)
+
+        return node_index, attr_index
+
+    def _validate_plan(self, context_id: str, plan: Dict[str, Any]):
+        try:
+            detail = self._fetch_context_definition(context_id)
+            if not isinstance(detail, dict):
+                self.logger.warning("Unexpected context definition response; skipping node/attribute validation.")
+                detail = {}
+            node_index, attr_index = self._collect_context_indexes(detail, plan)
+
+            def check_mapping(mapping_name, node_name, attr_name):
+                if node_name not in node_index:
+                    self.logger.warning(f"[plan] Mapping {mapping_name}: node '{node_name}' not found.")
+                if attr_name and (node_name, attr_name) not in attr_index:
+                    self.logger.warning(
+                        f"[plan] Mapping {mapping_name}: attribute '{node_name}.{attr_name}' not found."
+                    )
+
+            mapping_updates = plan.get("contextMappingUpdates", {})
+            if isinstance(mapping_updates, dict):
+                mapping_updates_list = mapping_updates.get("contextMappings", [])
+            else:
+                self.logger.warning("contextMappingUpdates must be an object; skipping mapping validation.")
+                mapping_updates_list = []
+            for mapping in mapping_updates_list:
+                if not isinstance(mapping, dict):
+                    continue
+                mapping_name = mapping.get("name") or "<unnamed>"
+                node_maps = mapping.get("contextNodeMappings", {})
+                if isinstance(node_maps, dict):
+                    node_maps = node_maps.get("contextNodeMappings", [])
+                for node_map in node_maps or []:
+                    if not isinstance(node_map, dict):
+                        continue
+                    node_name = node_map.get("contextNode")
+                    attr_maps = node_map.get("contextAttributeMappings", [])
+                    if isinstance(attr_maps, dict):
+                        attr_maps = attr_maps.get("contextAttributeMappings", [])
+                    for attr_map in attr_maps or []:
+                        if not isinstance(attr_map, dict):
+                            continue
+                        attr_name = attr_map.get("contextAttribute")
+                        check_mapping(mapping_name, node_name, attr_name)
+
+            for rule in plan.get("mappingRules", []):
+                mapping_name = rule.get("mappingName") or "<unnamed>"
+                node_name = rule.get("contextNode")
+                attr_name = rule.get("contextAttribute")
+                check_mapping(mapping_name, node_name, attr_name)
+        except Exception as exc:
+            self.logger.error(
+                "Plan validation failed: %s (plan=%s, context=%s, updates=%s)",
+                exc,
+                type(plan).__name__,
+                type(detail).__name__ if 'detail' in locals() else "n/a",
+                type(plan.get("contextMappingUpdates")).__name__ if isinstance(plan, dict) else "n/a",
+            )
+            raise
+
+    def _resolve_tags_by_name(self, context_id: str, tag_specs: Any):
+        if not isinstance(tag_specs, list):
+            raise TaskOptionsError("contextTagsByName must be a list")
+        detail = self._fetch_context_definition(context_id)
+        versions = detail.get("contextDefinitionVersionList", [])
+        if not versions:
+            self.logger.warning("No contextDefinitionVersionList found; cannot resolve tags by name.")
+            return []
+        nodes = versions[0].get("contextNodes", [])
+
+        node_index = {}
+        attr_index = {}
+        node_tag_index = {}
+        attr_tag_index = {}
+
+        def walk(node_list):
+            for node in node_list or []:
+                if not isinstance(node, dict):
+                    continue
+                node_id = node.get("contextNodeId")
+                node_name = node.get("name")
+                if node_id and node_name:
+                    node_index[node_name] = node_id
+                attrs_container = node.get("attributes", {})
+                if isinstance(attrs_container, list):
+                    attrs = attrs_container
+                else:
+                    if not isinstance(attrs_container, dict):
+                        attrs_container = {}
+                    attrs = attrs_container.get("contextAttributes", [])
+                for attr in attrs or []:
+                    attr_id = attr.get("contextAttributeId")
+                    attr_name = attr.get("name")
+                    if attr_id and node_name and attr_name:
+                        attr_index[(node_name, attr_name)] = attr_id
+                        tags = attr.get("attributeTags") or attr.get("tags") or []
+                        if isinstance(tags, list):
+                            attr_tag_index[(node_name, attr_name)] = {
+                                t.get("name") for t in tags if isinstance(t, dict) and t.get("name")
+                            }
+                tags = node.get("tags") or []
+                if isinstance(tags, list) and node_name:
+                    node_tag_index[node_name] = {
+                        t.get("name") for t in tags if isinstance(t, dict) and t.get("name")
+                    }
+                child_nodes_container = node.get("childNodes", {})
+                if isinstance(child_nodes_container, list):
+                    child_nodes = child_nodes_container
+                else:
+                    if not isinstance(child_nodes_container, dict):
+                        child_nodes_container = {}
+                    child_nodes = child_nodes_container.get("contextNodes", [])
+                walk(child_nodes)
+
+        walk(nodes)
+
+        resolved = []
+        for spec in tag_specs:
+            if not isinstance(spec, dict):
+                continue
+            tag_name = spec.get("name")
+            node_name = spec.get("nodeName")
+            attr_name = spec.get("attributeName")
+            if not tag_name or not node_name:
+                continue
+            if attr_name:
+                attr_id = attr_index.get((node_name, attr_name))
+                if not attr_id:
+                    self.logger.warning(f"Attribute tag not resolved: {node_name}.{attr_name}")
+                    continue
+                existing = attr_tag_index.get((node_name, attr_name), set())
+                if tag_name in existing:
+                    continue
+                resolved.append({"contextAttributeId": attr_id, "name": tag_name})
+            else:
+                node_id = node_index.get(node_name)
+                if not node_id:
+                    self.logger.warning(f"Node tag not resolved: {node_name}")
+                    continue
+                existing = node_tag_index.get(node_name, set())
+                if tag_name in existing:
+                    continue
+                resolved.append({"contextNodeId": node_id, "name": tag_name})
+        return resolved
+
+    def _resolve_context_attributes_by_name(self, context_id: str, attr_specs: Any):
+        if not isinstance(attr_specs, list):
+            raise TaskOptionsError("contextAttributesByName must be a list")
+        detail = self._fetch_context_definition(context_id)
+        versions = detail.get("contextDefinitionVersionList", []) if isinstance(detail, dict) else []
+        nodes = versions[0].get("contextNodes", []) if versions else []
+
+        node_index = {}
+        attr_index = {}
+
+        def walk_nodes(node_list):
+            for node in node_list or []:
+                if not isinstance(node, dict):
+                    continue
+                node_id = node.get("contextNodeId")
+                node_name = node.get("name")
+                if node_name and node_id:
+                    node_index[node_name] = node_id
+                attrs_container = node.get("attributes", {})
+                if isinstance(attrs_container, list):
+                    attrs = attrs_container
+                else:
+                    if not isinstance(attrs_container, dict):
+                        attrs_container = {}
+                    attrs = attrs_container.get("contextAttributes", [])
+                for attr in attrs or []:
+                    if not isinstance(attr, dict):
+                        continue
+                    attr_name = attr.get("name")
+                    attr_id = attr.get("contextAttributeId")
+                    if node_name and attr_name and attr_id:
+                        attr_index[(node_name, attr_name)] = attr_id
+                child_nodes_container = node.get("childNodes", {})
+                if isinstance(child_nodes_container, list):
+                    child_nodes = child_nodes_container
+                else:
+                    if not isinstance(child_nodes_container, dict):
+                        child_nodes_container = {}
+                    child_nodes = child_nodes_container.get("contextNodes", [])
+                walk_nodes(child_nodes)
+
+        walk_nodes(nodes)
+
+        resolved = []
+        for spec in attr_specs:
+            if not isinstance(spec, dict):
+                continue
+            node_name = spec.get("nodeName")
+            if not node_name or node_name not in node_index:
+                self.logger.warning(f"Context node not resolved for attribute add: {node_name}")
+                continue
+            attr_name = spec.get("name")
+            if attr_name and (node_name, attr_name) in attr_index:
+                continue
+            attr_payload = {
+                "contextNodeId": node_index[node_name],
+                "name": attr_name,
+                "dataType": spec.get("dataType", "STRING"),
+                "fieldType": spec.get("fieldType", "INPUTOUTPUT"),
+            }
+            if "isTransient" in spec:
+                attr_payload["isTransient"] = self._as_bool(spec.get("isTransient"))
+            resolved.append(attr_payload)
+        return resolved
+
+    def _sync_context_attribute_properties(
+        self, context_id: str, attr_specs: Any, dry_run: bool
+    ) -> bool:
+        """Patch mutable properties on existing context attributes.
+
+        The create path is idempotent and skips attributes that already exist, so
+        changes such as isTransient need a separate update path for reruns.
+        """
+        if not isinstance(attr_specs, list):
+            raise TaskOptionsError("contextAttributesByName must be a list")
+
+        detail = self._fetch_context_definition(context_id)
+        versions = detail.get("contextDefinitionVersionList", []) if isinstance(detail, dict) else []
+        nodes = versions[0].get("contextNodes", []) if versions else []
+        attr_index: Dict[tuple, Dict[str, Any]] = {}
+
+        def walk_nodes(node_list):
+            for node in node_list or []:
+                if not isinstance(node, dict):
+                    continue
+                node_name = node.get("name")
+                attrs_container = node.get("attributes", {})
+                if isinstance(attrs_container, list):
+                    attrs = attrs_container
+                else:
+                    if not isinstance(attrs_container, dict):
+                        attrs_container = {}
+                    attrs = attrs_container.get("contextAttributes", [])
+                for attr in attrs or []:
+                    if not isinstance(attr, dict):
+                        continue
+                    attr_name = attr.get("name")
+                    attr_id = attr.get("contextAttributeId")
+                    if node_name and attr_name and attr_id:
+                        attr_index[(node_name, attr_name)] = attr
+                child_nodes_container = node.get("childNodes", {})
+                if isinstance(child_nodes_container, list):
+                    child_nodes = child_nodes_container
+                else:
+                    if not isinstance(child_nodes_container, dict):
+                        child_nodes_container = {}
+                    child_nodes = child_nodes_container.get("contextNodes", [])
+                walk_nodes(child_nodes)
+
+        walk_nodes(nodes)
+
+        changed = False
+        for spec in attr_specs:
+            if not isinstance(spec, dict) or "isTransient" not in spec:
+                continue
+            attr = attr_index.get((spec.get("nodeName"), spec.get("name")))
+            if not attr:
+                continue
+            desired = self._as_bool(spec.get("isTransient"))
+            current = attr.get("isTransient")
+            if current is None:
+                current = attr.get("IsTransient")
+            if self._as_bool(current) == desired:
+                continue
+            attr_id = attr.get("contextAttributeId")
+            self.logger.info(
+                "Updating ContextAttribute %s.%s IsTransient=%s",
+                spec.get("nodeName"),
+                spec.get("name"),
+                desired,
+            )
+            self._patch_context_attribute(attr_id, {"IsTransient": desired}, dry_run)
+            changed = True
+        return changed
+
+    def _patch_context_attribute(self, context_attribute_id: str, payload: Dict[str, Any], dry_run: bool):
+        url, headers = self._build_url_and_headers(
+            f"sobjects/ContextAttribute/{context_attribute_id}"
+        )
+        self._make_request("patch", url, headers=headers, json=payload, dry_run=dry_run)
+
+    @staticmethod
+    def _as_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return value != 0
+        return str(value).lower() in {"1", "true", "yes"}
+
+    def _translate_mapping_rules(self, mapping_rules, detail, developer_name=None):
+        if not isinstance(mapping_rules, list):
+            raise TaskOptionsError("mappingRules must be a list")
+
+        if not isinstance(detail, dict):
+            return None
+
+        _versions = detail.get("contextDefinitionVersionList", [])
+        _version0_mappings = _versions[0].get("contextMappings", []) if _versions else []
+
+        mapping_index = {}
+        for mapping in _version0_mappings:
+            if isinstance(mapping, dict) and mapping.get("name"):
+                mapping_index[mapping["name"]] = mapping
+
+        node_index, attr_index = self._collect_context_indexes(detail, {})
+
+        # Build parent_node_id_by_node_name so child node mappings can set mappedContextNodeId.
+        # CS DocGen requires this on child node mappings to resolve repeating-section records.
+        parent_node_id_by_node_name: Dict[str, str] = {}
+        def _collect_parent_ids(nodes_list, parent_id=None):
+            for node in nodes_list if isinstance(nodes_list, list) else []:
+                name = node.get("name")
+                nid = node.get("contextNodeId")
+                if parent_id and name:
+                    parent_node_id_by_node_name[name] = parent_id
+                child_container = node.get("childNodes", {})
+                children = (
+                    child_container if isinstance(child_container, list)
+                    else child_container.get("contextNodes", []) if isinstance(child_container, dict)
+                    else []
+                )
+                _collect_parent_ids(children, nid)
+        for _v in _versions[:1]:
+            _collect_parent_ids(_v.get("contextNodes", []))
+
+        def find_attr_mapping_id(node_name, attr_name):
+            for mapping in _version0_mappings:
+                if not isinstance(mapping, dict):
+                    continue
+                for node_map in mapping.get("contextNodeMappings", []) or []:
+                    if node_map.get("contextNodeName") != node_name:
+                        continue
+                    for attr_map in node_map.get("attributeMappings", []) or []:
+                        if attr_map.get("contextAttributeName") == attr_name:
+                            return attr_map.get("contextAttributeMappingId")
+            return None
+
+        # Group attribute mappings by (mappingId, nodeId, sObject) so all attributes for the
+        # same node land in a single node-mapping POST rather than one per rule (which causes
+        # DUPLICATE_VALUE errors when the node mapping already exists from the first rule).
+        grouped: Dict[tuple, Dict] = {}
+        for rule in mapping_rules:
+            if not isinstance(rule, dict):
+                continue
+            mapping_name = rule.get("mappingName")
+            node_name = rule.get("contextNode")
+            attr_name = rule.get("contextAttribute")
+            if not mapping_name or not node_name or not attr_name:
+                continue
+
+            mapping_meta = mapping_index.get(mapping_name)
+            if not mapping_meta:
+                self.logger.warning(f"Mapping not found for rule: {mapping_name}")
+                continue
+            mapping_id = mapping_meta.get("contextMappingId")
+            if not mapping_id:
+                self.logger.warning(f"Mapping id not found for rule: {mapping_name}")
+                continue
+
+            node_map_meta = None
+            for existing in mapping_meta.get("contextNodeMappings", []) or []:
+                if existing.get("contextNodeName") == node_name:
+                    node_map_meta = existing
+                    break
+
+            node_id = (node_map_meta or {}).get("contextNodeId") or node_index.get(node_name)
+            if not node_id:
+                self.logger.warning(f"Context node id not found for rule: {mapping_name} -> {node_name}")
+                continue
+
+            attr_id = attr_index.get((node_name, attr_name))
+            if not attr_id:
+                self.logger.warning(
+                    f"Context attribute id not found for rule: {mapping_name} -> {node_name}.{attr_name}"
+                )
+                continue
+
+            attr_mapping_id = None
+            existing_input_name = None
+            if node_map_meta:
+                for attr_map in node_map_meta.get("attributeMappings", []) or []:
+                    if attr_map.get("contextAttributeName") == attr_name:
+                        attr_mapping_id = attr_map.get("contextAttributeMappingId")
+                        existing_input_name = attr_map.get("contextInputAttributeName")
+                        break
+
+            mapping_type = (rule.get("mappingType") or "SOBJECT").upper()
+            requested_input = rule.get("sObjectField")
+            if mapping_type != "CONTEXT" and attr_name == "TransactionType":
+                self.logger.info(
+                    f"Skipping TransactionType mapping update for {mapping_name} -> {node_name}"
+                )
+                continue
+            if mapping_type == "CONTEXT":
+                # Even if the attribute mapping exists, we may still need to set
+                # mappedContextDefinitionName on the mapping (Mapping Source = Context Definition).
+                existing_mapped_ctx = mapping_meta.get("mappedContextDefinitionId") or mapping_meta.get("mappedContextDefinitionName")
+                needs_ctx_def_update = not existing_mapped_ctx
+                if attr_mapping_id and (requested_input is None or requested_input == existing_input_name) and not needs_ctx_def_update:
+                    self.logger.info(
+                        f"Skipping existing attribute mapping for {mapping_name} -> {node_name}.{attr_name}"
+                    )
+                    continue
+                if attr_mapping_id and (requested_input is None or requested_input == existing_input_name) and needs_ctx_def_update:
+                    # Attribute mapping exists but MappedContextDefinition is not set on the
+                    # ContextNodeMapping sObject. Set it directly via the sObject REST API
+                    # (the Connect API context-mappings PATCH silently ignores this field).
+                    mapped_ctx_def_name = developer_name or detail.get("developerName") or detail.get("contextDefinitionId")
+                    node_mapping_id = (node_map_meta or {}).get("contextNodeMappingId")
+                    if mapped_ctx_def_name and node_mapping_id:
+                        self.logger.info(
+                            f"Attribute mapping exists for {mapping_name} -> {node_name}.{attr_name} "
+                            f"but MappedContextDefinition is not set; updating via sObject API."
+                        )
+                        dry_run = str(self.options.get("dry_run", "")).lower() in {"1", "true", "yes"}
+                        self._set_mapped_context_definition(node_mapping_id, mapped_ctx_def_name, dry_run=dry_run)
+                    continue
+                if attr_mapping_id and requested_input and requested_input != existing_input_name:
+                    self.logger.warning(
+                        f"Existing attribute mapping differs for {mapping_name} -> {node_name}.{attr_name}; skipping update."
+                    )
+                    continue
+            else:
+                # For SOBJECT mappings, allow updates to align with desired hydration details.
+                if attr_mapping_id and requested_input == existing_input_name:
+                    self.logger.info(
+                        f"Updating existing attribute mapping for {mapping_name} -> {node_name}.{attr_name}"
+                    )
+            # For SOBJECT mappings, contextInputAttributeName should remain the context attribute name.
+            context_attribute_mapping = {
+                "contextAttributeId": attr_id,
+                "contextInputAttributeName": attr_name,
+            }
+            mapped_context_node_id = None
+            mapped_context_definition = None
+            if mapping_type == "CONTEXT":
+                source_node = rule.get("sourceContextNode")
+                source_attr = rule.get("sourceContextAttribute")
+                source_node_id = node_index.get(source_node)
+                source_attr_id = attr_index.get((source_node, source_attr))
+                source_attr_mapping_id = find_attr_mapping_id(source_node, source_attr)
+                if not source_node_id or not source_attr_id or not source_attr_mapping_id:
+                    self.logger.warning(
+                        f"Context source not resolved for rule: {mapping_name} -> {source_node}.{source_attr}"
+                    )
+                    continue
+                context_attribute_mapping["contextInputAttributeName"] = attr_name
+                context_attribute_mapping["hydrationDetails"] = {
+                    "contextAttrContextHydrationDetails": [
+                        {
+                            "queryAttribute": source_attr_id,
+                            "parentAttributeMappingId": source_attr_mapping_id,
+                        }
+                    ]
+                }
+                mapped_context_node_id = source_node_id
+                mapped_context_definition = developer_name or detail.get("developerName") or detail.get("contextDefinitionId")
+            else:
+                if rule.get("sObject") and rule.get("sObjectField"):
+                    hydration_entry: Dict[str, Any] = {
+                        "sObjectDomain": rule.get("sObject"),
+                        "queryAttribute": rule.get("sObjectField"),
+                    }
+                    if not rule.get("childSObjectField"):
+                        # Simple field mapping — include hydration in the PATCH payload.
+                        # Traversal rules (childSObjectField set) are handled separately via
+                        # _apply_traversal_hydration because the Connect API rejects them.
+                        context_attribute_mapping["hydrationDetails"] = {
+                            "contextAttrHydrationDetails": [hydration_entry]
+                        }
+            if attr_mapping_id:
+                context_attribute_mapping["contextAttributeMappingId"] = attr_mapping_id
+
+            group_key = (mapping_id, node_id, rule.get("sObject"))
+            if group_key not in grouped:
+                # For child nodes, derive mappedContextNodeId from the hierarchy so that CS
+                # DocGen can resolve repeating-section records (e.g. QuoteLineItems for Line).
+                effective_mapped_node_id = mapped_context_node_id or parent_node_id_by_node_name.get(node_name)
+                grouped[group_key] = {
+                    "contextMappingId": mapping_id,
+                    "contextNodeMappings": {
+                        "contextNodeMappings": [
+                            {
+                                "contextNodeId": node_id,
+                                "contextNodeMappingId": (node_map_meta or {}).get("contextNodeMappingId"),
+                                "sObjectName": rule.get("sObject"),
+                                "mappedContextNodeId": effective_mapped_node_id,
+                                "attributeMappings": {
+                                    "contextAttributeMappings": []
+                                },
+                            }
+                        ]
+                    },
+                    "mappedContextDefinitionName": mapped_context_definition,
+                }
+            grouped[group_key]["contextNodeMappings"]["contextNodeMappings"][0][
+                "attributeMappings"
+            ]["contextAttributeMappings"].append(context_attribute_mapping)
+
+        updates = list(grouped.values())
+        if not updates:
+            return None
+        return {"contextMappings": updates}
+
+    def _collect_node_names(self, detail: Dict[str, Any]) -> set:
+        """Return the set of all node names present in a context definition detail response."""
+        names: set = set()
+        versions = detail.get("contextDefinitionVersionList", []) if isinstance(detail, dict) else []
+        nodes = versions[0].get("contextNodes", []) if versions else []
+
+        def walk(node_list):
+            for node in node_list or []:
+                if not isinstance(node, dict):
+                    continue
+                name = node.get("name")
+                if name:
+                    names.add(name)
+                child_container = node.get("childNodes", {})
+                children = (
+                    child_container.get("contextNodes", [])
+                    if isinstance(child_container, dict)
+                    else (child_container or [])
+                )
+                walk(children)
+
+        walk(nodes)
+        return names
+
+    def _filter_existing_mappings(self, context_id: str, payload: Dict[str, Any]):
+        detail = self._fetch_context_definition(context_id)
+        if not isinstance(detail, dict):
+            return payload
+        _versions = detail.get("contextDefinitionVersionList", [])
+        existing = {
+            mapping.get("name")
+            for mapping in (_versions[0].get("contextMappings", []) if _versions else [])
+            if isinstance(mapping, dict)
+        }
+        if not isinstance(payload, dict):
+            return payload
+        mappings = payload.get("contextMappings")
+        if not isinstance(mappings, list):
+            return payload
+        filtered = [m for m in mappings if isinstance(m, dict) and m.get("name") not in existing]
+        if not filtered:
+            return None
+        return {**payload, "contextMappings": filtered}
+
+    def _log_verification(self, detail: Dict[str, Any], plan: Dict[str, Any]):
+        if not isinstance(detail, dict):
+            self.logger.warning("Verification skipped: context definition response not a dict.")
+            return
+        versions = detail.get("contextDefinitionVersionList", [])
+        if not versions or not isinstance(versions[0], dict):
+            self.logger.warning("Verification skipped: missing contextDefinitionVersionList.")
+            return
+
+        mapping_rules = plan.get("mappingRules", []) or []
+        rule_keys = {(r.get("mappingName"), r.get("contextNode"), r.get("contextAttribute")) for r in mapping_rules if isinstance(r, dict)}
+        tags_by_name = plan.get("contextTagsByName", []) or []
+        attrs_by_name = plan.get("contextAttributesByName", []) or []
+
+        matched_rules = []
+        missing_rules = []
+        for mapping in versions[0].get("contextMappings", []):
+            if not isinstance(mapping, dict):
+                continue
+            mapping_name = mapping.get("name")
+            for node_map in mapping.get("contextNodeMappings", []) or []:
+                if not isinstance(node_map, dict):
+                    continue
+                node_name = node_map.get("contextNodeName")
+                sobject = node_map.get("sObjectName")
+                for attr in node_map.get("attributeMappings", []) or []:
+                    if not isinstance(attr, dict):
+                        continue
+                    attr_name = attr.get("contextAttributeName")
+                    key = (mapping_name, node_name, attr_name)
+                    if key in rule_keys:
+                        matched_rules.append(
+                            {
+                                "mapping": mapping_name,
+                                "node": node_name,
+                                "sObject": sobject,
+                                "contextAttribute": attr_name,
+                                "contextInputAttribute": attr.get("contextInputAttributeName"),
+                                "hasHydrationDetail": bool(attr.get("contextAttrHydrationDetailList")),
+                            }
+                        )
+        for key in sorted(rule_keys):
+            if not any(
+                item.get("mapping") == key[0] and item.get("node") == key[1] and item.get("contextAttribute") == key[2]
+                for item in matched_rules
+            ):
+                missing_rules.append(key)
+
+        found_attrs = []
+        found_tags = []
+
+        def walk(nodes):
+            for node in nodes or []:
+                if not isinstance(node, dict):
+                    continue
+                node_name = node.get("name")
+                attrs_container = node.get("attributes", {})
+                if isinstance(attrs_container, list):
+                    attrs = attrs_container
+                else:
+                    if not isinstance(attrs_container, dict):
+                        attrs_container = {}
+                    attrs = attrs_container.get("contextAttributes", [])
+                for attr in attrs or []:
+                    if not isinstance(attr, dict):
+                        continue
+                    attr_name = attr.get("name")
+                    if any(a.get("nodeName") == node_name and a.get("name") == attr_name for a in attrs_by_name):
+                        found_attrs.append(f"{node_name}.{attr_name}")
+                    for tag in attr.get("attributeTags") or attr.get("tags") or []:
+                        if isinstance(tag, dict) and any(
+                            t.get("nodeName") == node_name and t.get("attributeName") == attr_name and t.get("name") == tag.get("name")
+                            for t in tags_by_name
+                        ):
+                            found_tags.append(f"{node_name}.{attr_name}:{tag.get('name')}")
+                child_nodes_container = node.get("childNodes", {})
+                if isinstance(child_nodes_container, list):
+                    child_nodes = child_nodes_container
+                else:
+                    if not isinstance(child_nodes_container, dict):
+                        child_nodes_container = {}
+                    child_nodes = child_nodes_container.get("contextNodes", [])
+                walk(child_nodes)
+
+        walk(versions[0].get("contextNodes", []))
+
+        if matched_rules:
+            self.logger.info("Verification: mapping rules applied:")
+            for item in matched_rules:
+                self.logger.info(json.dumps(item))
+                if item.get("sObject") and not item.get("hasHydrationDetail"):
+                    self.logger.warning(
+                        "Verification: missing hydration detail for %s.%s in %s (sObject=%s)",
+                        item.get("node"),
+                        item.get("contextAttribute"),
+                        item.get("mapping"),
+                        item.get("sObject"),
+                    )
+        if missing_rules:
+            self.logger.warning("Verification: mapping rules missing:")
+            for key in missing_rules:
+                self.logger.warning(json.dumps({"mapping": key[0], "node": key[1], "contextAttribute": key[2]}))
+        if found_attrs:
+            self.logger.info("Verification: attributes present: %s", ", ".join(sorted(set(found_attrs))))
+        if found_tags:
+            self.logger.info("Verification: tags present: %s", ", ".join(sorted(set(found_tags))))
+
+    def _activate_context_definition(self, context_id: str, dry_run: bool):
+        url, headers = self._build_url_and_headers(
+            f"connect/context-definitions/{context_id}"
+        )
+        payload = {"isActive": "true"}
+        self._make_request("patch", url, headers=headers, json=payload, dry_run=dry_run)
+
+    @abstractmethod
+    def get_keychain_class(self):
+        pass
+
+    @abstractmethod
+    def get_keychain_key(self):
+        pass
+

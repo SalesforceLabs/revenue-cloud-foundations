@@ -1,0 +1,4 @@
+feature: prm_pricing
+feature_flag: prm_pricing
+# Column patching removed pending proper conditional-per-quote-type implementation (issue #244).
+patches: []

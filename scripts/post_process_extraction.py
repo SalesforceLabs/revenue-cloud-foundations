@@ -1,0 +1,1115 @@
+#!/usr/bin/env python3
+"""
+Post-process SFDMU extraction output into import-ready CSVs.
+
+This script bridges the gap between raw SFDMU extraction output (org > CSV)
+and the import-ready format expected by the data plans (CSV > org).
+
+Key transformations:
+  - Status rewrite:  Active/Inactive > Draft for configurable objects
+  - Column alignment: Reorder and filter columns to match the existing plan CSVs
+  - objectset_source: Generate Pass 2+ CSVs in the objectset_source/ directory
+  - Composite keys:   Build composite key columns from component fields (individual columns preferred over $$ notation)
+  - Diff mode:        Compare extraction against current plan and report deltas
+
+Usage:
+  python3 scripts/post_process_extraction.py <extraction_dir> <plan_dir> [options]
+
+  --output-dir DIR   Write processed CSVs here (default: <extraction_dir>/processed/)
+  --diff-only        Only produce a diff report; don't write processed CSVs
+  --copy-to-plan     Copy processed CSVs into the plan directory (updates in place)
+  --verbose          Print detailed processing info
+"""
+import argparse
+import csv
+import json
+import os
+import shutil
+import sys
+from collections import OrderedDict
+from pathlib import Path
+
+# Bootstrap the scripts/ dir onto sys.path so `import sfdmu_export` resolves both
+# when run as a script (scripts/ is already sys.path[0]) and when the test suite
+# spec-loads this module by path (its dir is NOT auto-added then).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import sfdmu_export  # noqa: E402  (after the path bootstrap above)
+
+
+# Objects whose Status field should be rewritten from Active/Inactive to Draft.
+# Only objects that go through a Draft-then-Activate workflow are listed here.
+# Objects loaded directly as Active (e.g., UnitOfMeasure, UsageGrantRenewalPolicy,
+# UsageGrantRolloverPolicy, UsageResourceBillingPolicy) are NOT rewritten because
+# they don't have an Apex-driven activation step -- they're imported as Active.
+STATUS_REWRITE_MAP = {
+    "UnitOfMeasureClass": ["Status"],
+    "UsageResource": ["Status"],
+    "ProductUsageResource": ["Status"],
+    "ProductUsageGrant": ["Status"],
+    "RateCard": ["Status"],
+    "RateCardEntry": ["Status"],
+    "BillingPolicy": ["Status"],
+    "BillingTreatment": ["Status"],
+    "BillingTreatmentItem": ["Status"],
+    "TaxTreatment": ["Status"],
+    "TaxPolicy": ["Status"],
+}
+
+# Values that should be rewritten to Draft
+ACTIVE_STATUSES = {"Active", "Inactive"}
+
+
+def normalize_header(h: str) -> str:
+    """Normalize a CSV header for matching: strip BOM, whitespace, and surrounding quotes.
+
+    SFDMU extraction can write headers with BOM (\\ufeff) and/or quoted names (e.g. "Code"),
+    which would otherwise prevent matching plan columns like Code.
+    """
+    if not h:
+        return h
+    s = h.strip().lstrip("\ufeff").strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        s = s[1:-1].strip()
+    return s
+
+
+def load_export_json(plan_dir: str) -> dict:
+    """Load and return the export.json from the plan directory."""
+    path = os.path.join(plan_dir, "export.json")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def get_object_name_from_query(query: str) -> str:
+    """Extract the object API name from a SOQL query string.
+
+    A non-string `query` (e.g. a JSON list from a hand-edited export.json) returns ""
+    rather than raising — `.upper()` on a list throws AttributeError straight out of the
+    caller, aborting the whole run over one malformed declaration. Callers already skip
+    on an empty name (`if not name: continue`). This mirrors the guard added to
+    validate_sfdmu_v5_datasets.py's `_extract_object_name` in PR #397; see todo pack 182.
+    """
+    # Delegates to the shared subquery-aware parser (sfdmu_export.extract_object_name):
+    # a SELECT-clause subquery's inner FROM is stripped first, so a top-level pass query
+    # (pack 168) like `SELECT Id, (SELECT Id FROM Contacts) FROM Account` resolves to
+    # Account, not Contacts. Non-string/malformed input returns "" (never raises), so the
+    # caller's malformed-declaration handling is preserved.
+    return sfdmu_export.extract_object_name(query)
+
+
+def parse_plan_structure(export_json: dict) -> tuple:
+    """Parse export.json into a structure mapping object names to their config.
+
+    Returns a tuple (plan_structure, passes, malformed) where:
+      plan_structure: object_name -> {
+        "pass_index": int (0-based),
+        "operation": str,
+        "externalId": str,
+        "query": str,
+        "fields": list[str],  # fields from the SELECT clause
+      }
+      passes: object_name -> list of (pass_index, entry) for all passes
+        (used for objectset_source generation; plan_structure keeps only first pass).
+      malformed: list of {"query", "pass_index"} for declarations whose `query` is
+        present but yields no object name (non-string, or a string with no FROM). This
+        is NOT the same as an empty/absent query: a *dropped* declaration is dangerous,
+        because under --copy-to-plan the object's raw extracted CSV is still synced over
+        the tracked plan CSV (sync_to_plan's incidental-copy fallback), bypassing all
+        processing. The caller must treat a non-empty `malformed` as fatal — the
+        validator flags the same shape (a non-string/unparseable `query`) as
+        Severity.HIGH (validate_sfdmu_v5_datasets.py); this command deliberately
+        exits with its own CRITICAL result instead of the raw-CSV sync.
+    For objects appearing in multiple passes, only the first pass entry
+    is stored in plan_structure; later passes are in passes.
+
+    Supports both objectSets (multi-pass plans like qb-rating) and flat
+    "objects" (single-pass plans like qb-pcm).
+    """
+    result = {}
+    passes = {}
+    malformed = []
+    # Normalize passes exactly as SFDMU does — a flat top-level `objects` becomes a
+    # pass, and (the fix in todo pack 168) a non-empty `objects` alongside a
+    # non-empty `objectSets` is prepended as pass 1, not dropped. The old local
+    # "objectSets wins outright" fallback here would skip a both-arrays plan's
+    # top-level pass entirely: its records land in the extraction but never enter
+    # `plan_structure`/`passes`, so the roundtrip skips their transformations and
+    # `--copy-to-plan` could sync their raw CSV incidentally.
+    object_sets = sfdmu_export.normalize_object_sets(export_json)
+    for idx, obj_set in enumerate(object_sets):
+        for obj in obj_set.get("objects", []):
+            # JS truthiness, not Python's: SFDMU reads `excluded` in JS, where `[]`/`{}`
+            # are truthy and skip the declaration (pack 168 now walks the prepended
+            # top-level pass through here too).
+            if sfdmu_export.is_js_truthy(obj.get("excluded")):
+                continue
+            query = obj.get("query", "")
+            name = get_object_name_from_query(query)
+            if not name:
+                # A present-but-unparseable query is a malformed declaration, not an
+                # empty slot — record it so the caller can fail instead of silently
+                # dropping the object (which would let its raw CSV be synced as-is).
+                # The ONLY non-malformed no-name case is an absent or empty *string*
+                # slot (missing key defaults to ""). Every non-string value — [], {},
+                # 0, False, null — is malformed, even the falsy ones: a plain
+                # truthiness test would wave those straight back onto the raw-CSV path.
+                is_empty_string_slot = isinstance(query, str) and query == ""
+                if not is_empty_string_slot:
+                    malformed.append({"query": query, "pass_index": idx})
+                continue
+            fields = parse_select_fields(query)
+            entry = {
+                "pass_index": idx,
+                "operation": obj.get("operation", "Upsert"),
+                "externalId": obj.get("externalId", "Id"),
+                "query": query,
+                "fields": fields,
+            }
+            if name not in result:
+                result[name] = entry
+            # Track all passes for objectset_source generation
+            passes.setdefault(name, []).append((idx, entry))
+    return result, passes, malformed
+
+
+def parse_select_fields(query: str) -> list:
+    """Extract field names from a SOQL SELECT clause.
+
+    Non-string `query` returns [] rather than raising, for the same reason as
+    get_object_name_from_query above — mirrors validate_sfdmu_v5_datasets.py's
+    `_parse_select_fields` guard (PR #397, todo pack 182).
+    """
+    # Delegates to the shared subquery-aware parser (sfdmu_export.parse_select_fields):
+    # a SELECT-clause subquery is removed before the SELECT…FROM match, so the outer
+    # query's fields are read rather than the subquery's truncated ones (a top-level pass
+    # query, pack 168, could carry one). Non-string input returns [] (never raises).
+    return sfdmu_export.parse_select_fields(query)
+
+
+def load_plan_csv(plan_dir: str, object_name: str) -> tuple:
+    """Load an existing plan CSV and return (headers, rows). Headers are normalized for matching."""
+    path = os.path.join(plan_dir, f"{object_name}.csv")
+    if not os.path.isfile(path):
+        return None, None
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        headers = next(reader, None)
+        if headers:
+            headers = [normalize_header(h) for h in headers]
+        rows = list(reader)
+    return headers, rows
+
+
+def load_extracted_csv(extraction_dir: str, object_name: str) -> tuple:
+    """Load an extracted CSV and return (headers, rows). Headers are normalized for matching."""
+    path = os.path.join(extraction_dir, f"{object_name}.csv")
+    if not os.path.isfile(path):
+        return None, None
+    with open(path, "r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        headers = next(reader, None)
+        if headers:
+            headers = [normalize_header(h) for h in headers]
+        rows = list(reader)
+    return headers, rows
+
+
+def rewrite_status(rows: list, headers: list, object_name: str) -> list:
+    """Rewrite Status fields from Active/Inactive to Draft."""
+    fields = STATUS_REWRITE_MAP.get(object_name, [])
+    if not fields:
+        return rows
+    indices = []
+    for field in fields:
+        if field in headers:
+            indices.append(headers.index(field))
+    if not indices:
+        return rows
+    new_rows = []
+    for row in rows:
+        row = list(row)
+        for idx in indices:
+            if idx < len(row) and row[idx] in ACTIVE_STATUSES:
+                row[idx] = "Draft"
+        new_rows.append(row)
+    return new_rows
+
+
+# ---------------------------------------------------------------------------
+# ID-to-portable-value resolution for text fields that store raw Salesforce IDs.
+# These are NOT reference/lookup fields — they are text fields that hold an ID
+# and need to be resolved to their corresponding traversal field value.
+# ---------------------------------------------------------------------------
+# Map: object_name -> list of (id_field, traversal_field, description)
+# When id_field contains a non-empty, non-#N/A value, replace it with the
+# value from traversal_field in the same row (which SFDMU already resolved).
+ID_TEXT_FIELD_RESOLUTION = {
+    "ProductFulfillmentDecompRule": [
+        ("SourceIdentifier", "SourceProduct.StockKeepingUnit", "Product2 ID → SKU"),
+        ("SourceClassIdentifier", "SourceProductClassification.Name", "ProductClassification ID → Name"),
+    ],
+}
+
+
+def resolve_id_text_fields(rows: list, headers: list, object_name: str,
+                           verbose: bool = False) -> list:
+    """Replace raw Salesforce IDs in text fields with portable traversal values.
+
+    Some sObjects store IDs in text fields (e.g. SourceIdentifier on
+    ProductFulfillmentDecompRule holds a Product2 Id). SFDMU extracts these
+    as-is. This function substitutes the portable value from the corresponding
+    traversal field that was queried in the same row.
+    """
+    mappings = ID_TEXT_FIELD_RESOLUTION.get(object_name)
+    if not mappings:
+        return rows
+
+    resolved = []
+    for id_field, traversal_field, desc in mappings:
+        if id_field in headers and traversal_field in headers:
+            resolved.append((
+                headers.index(id_field),
+                headers.index(traversal_field),
+                id_field,
+                traversal_field,
+                desc,
+            ))
+
+    if not resolved:
+        return rows
+
+    # Only treat empty and SFDMU's explicit null marker (#N/A) as missing.
+    # Do NOT include "N/A" — it is a legitimate business value in several CSVs
+    # (e.g. AttributePicklistValue: Rear Storage "N/A", RAID "N/A").
+    na_values = {"", "#N/A"}
+    new_rows = []
+    counts = {r[2]: 0 for r in resolved}
+    for row in rows:
+        row = list(row)
+        for id_idx, trav_idx, id_name, trav_name, desc in resolved:
+            id_val = row[id_idx] if id_idx < len(row) else ""
+            trav_val = row[trav_idx] if trav_idx < len(row) else ""
+            if id_val not in na_values and trav_val not in na_values:
+                row[id_idx] = trav_val
+                counts[id_name] += 1
+        new_rows.append(row)
+
+    if verbose:
+        for id_name, count in counts.items():
+            if count:
+                print(f"    Resolved {count} {id_name} IDs to portable values")
+
+    return new_rows
+
+
+# ---------------------------------------------------------------------------
+# Field defaults: populate fields that may not be returned by extraction
+# but are required in the plan CSV for portability across org configurations.
+# ---------------------------------------------------------------------------
+# Map: object_name -> list of (target_field, source_field, description)
+# When target_field is empty/#N/A, copy the value from source_field.
+FIELD_DEFAULTS = {
+    "AttributePicklist": [
+        ("Code", "Name", "Code defaults to Name when not queryable (Commerce-dependent field)"),
+    ],
+}
+
+
+def apply_field_defaults(rows: list, headers: list, object_name: str,
+                         verbose: bool = False) -> list:
+    """Populate empty fields with default values from other fields in the same row.
+
+    Some fields (e.g. AttributePicklist.Code) are required in certain org
+    configurations but may not exist or may be returned as null during
+    extraction.  This function copies a source field value into the target
+    field when the target is empty, ensuring the plan CSV is portable.
+    """
+    defaults = FIELD_DEFAULTS.get(object_name)
+    if not defaults:
+        return rows
+
+    resolved = []
+    for target, source, desc in defaults:
+        if target in headers and source in headers:
+            resolved.append((
+                headers.index(target),
+                headers.index(source),
+                target,
+                source,
+                desc,
+            ))
+
+    if not resolved:
+        return rows
+
+    # Only treat empty and SFDMU's explicit null marker (#N/A) as missing.
+    # Do NOT include "N/A" — it is a legitimate business value in several CSVs.
+    na_values = {"", "#N/A"}
+    new_rows = []
+    counts = {r[2]: 0 for r in resolved}
+    for row in rows:
+        row = list(row)
+        for tgt_idx, src_idx, tgt_name, src_name, desc in resolved:
+            tgt_val = row[tgt_idx] if tgt_idx < len(row) else ""
+            src_val = row[src_idx] if src_idx < len(row) else ""
+            if tgt_val in na_values and src_val not in na_values:
+                row[tgt_idx] = src_val
+                counts[tgt_name] += 1
+        new_rows.append(row)
+
+    if verbose:
+        for tgt_name, count in counts.items():
+            if count:
+                print(f"    Defaulted {count} {tgt_name} values from source field")
+
+    return new_rows
+
+
+def load_code_map(path: str) -> dict:
+    """Load the org-derived Name->Code backfill map produced by the extract task.
+
+    Shape: { "<ObjectName>": { "<Rel>.<CodeField>": { "<NameValue>": "<CodeValue>" } } }
+    Returns {} when no path is given or the file is missing/unreadable.
+    """
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def backfill_relationship_codes(headers: list, rows: list, object_name: str,
+                                code_map: dict, verbose: bool = False) -> list:
+    """Fill blank/#N/A cross-object externalId code components from a Name->Code map.
+
+    SFDMU extraction emits #N/A for externalId-component traversal fields whose
+    target object is not part of the plan (e.g. ``UsageResource.Code`` and
+    ``RateUnitOfMeasure.UnitCode`` on RateCardEntry), even though the value exists
+    in the source org.  The extract task supplies an org-derived
+    ``{column: {Name: Code}}`` map; here we restore each blank value by joining on
+    the populated sibling ``<Rel>.Name`` column.
+
+    Runs on the raw extracted rows BEFORE column alignment so the composite-key
+    ($$...) columns are subsequently built from the restored values.
+    """
+    obj_map = (code_map or {}).get(object_name)
+    if not obj_map:
+        return rows
+
+    idx = {h: i for i, h in enumerate(headers)}
+    na_values = {"", "#N/A"}
+    plan = []
+    for col, name2code in obj_map.items():
+        if col not in idx or "." not in col:
+            continue
+        # Sibling join column: same relationship path, leaf field replaced with Name.
+        join_col = col.rsplit(".", 1)[0] + ".Name"
+        if join_col in idx:
+            plan.append((idx[col], idx[join_col], col, name2code))
+
+    if not plan:
+        return rows
+
+    fills = {}
+    new_rows = []
+    for row in rows:
+        row = list(row)
+        for col_i, join_i, col, name2code in plan:
+            cur = row[col_i] if col_i < len(row) else ""
+            if cur in na_values:
+                join_val = row[join_i] if join_i < len(row) else ""
+                code = name2code.get(join_val)
+                if code:
+                    row[col_i] = code
+                    fills[col] = fills.get(col, 0) + 1
+        new_rows.append(row)
+
+    if verbose and fills:
+        for col, n in fills.items():
+            print(f"    Backfilled {n} {col} values from org Name->Code map")
+
+    return new_rows
+
+
+def resolve_component_value(row_dict: dict, field: str) -> str:
+    """Resolve a composite-key component to its value, tolerating prefix differences.
+
+    Extraction CSVs carry a relationship component under varying paths: sometimes
+    the fully qualified path (e.g. ``RateCardEntry.RateCard.Name``), sometimes only
+    a shorter suffix (e.g. ``RateCard.Name``).  Nested FK composite columns
+    (``Parent.$$A$B``) expand to parent-qualified components such as
+    ``RateCardEntry.Product.StockKeepingUnit`` that may not exist verbatim in the
+    extraction even though the underlying value is present on the child row under
+    ``Product.StockKeepingUnit``.
+
+    Try the exact field first, then fall back to progressively shorter dotted
+    suffixes (longest/most-specific first), returning the first match.  This lets
+    the post-process build qb-uniform nested composite keys from whatever traversal
+    columns SFDMU emitted, instead of leaving them blank.
+    """
+    if field in row_dict:
+        return str(row_dict[field])
+    parts = field.split(".")
+    # Drop the leftmost segment one at a time: longest (most specific) suffix wins.
+    for start in range(1, len(parts)):
+        suffix = ".".join(parts[start:])
+        if suffix in row_dict:
+            return str(row_dict[suffix])
+    return ""
+
+
+def build_composite_key_column(row_dict: dict, components: list) -> str:
+    """Build a composite key value from component field values (legacy $$ support).
+
+    components is a list of field names like ["Product.StockKeepingUnit", "UsageResource.Code"].
+    The composite value is the concatenation with ; separators (matching SFDMU import notation).
+
+    Each component is resolved via ``resolve_component_value`` so parent-qualified
+    nested-composite components (``RateCardEntry.Product.StockKeepingUnit``) fall
+    back to the bare traversal column the extraction actually emitted.
+
+    NOTE: Plan CSVs now use individual columns instead of $$ composite columns.
+    This function is retained for backward compatibility with older plan formats.
+    """
+    values = [resolve_component_value(row_dict, c) for c in components]
+    return ";".join(values)
+
+
+def parse_composite_key_header(header: str) -> list:
+    """Parse a $$Field1$Field2 header into its component field names (legacy $$ support).
+
+    Example: "$$Product.StockKeepingUnit$UsageResource.Code"
+      returns ["Product.StockKeepingUnit", "UsageResource.Code"]
+
+    NOTE: Plan CSVs now use individual columns instead of $$ composite columns.
+    This function is retained for backward compatibility with older plan formats.
+    """
+    if not header.startswith("$$"):
+        return []
+    inner = header[2:]
+    return inner.split("$")
+
+
+def align_columns(extracted_headers: list, extracted_rows: list,
+                   plan_headers: list, object_name: str, verbose: bool = False) -> tuple:
+    """Align extracted CSV columns to match the plan CSV column order.
+
+    For columns present in the plan but missing from extraction, fill with empty string.
+    For legacy $$ composite key columns, build them from component fields.
+    Plan CSVs now prefer individual columns over $$ notation for SOQL compatibility.
+    Returns (aligned_headers, aligned_rows).
+    """
+    if plan_headers is None:
+        return extracted_headers, extracted_rows
+
+    # Build index map for extracted data
+    ext_idx = {h: i for i, h in enumerate(extracted_headers)}
+
+    aligned_headers = list(plan_headers)
+    aligned_rows = []
+
+    for row in extracted_rows:
+        row_dict = {h: (row[i] if i < len(row) else "") for h, i in ext_idx.items()}
+        aligned_row = []
+        for h in plan_headers:
+            if h in ext_idx:
+                # Column exists in extraction -- use the original value directly.
+                # This preserves SFDMU's composite key formatting (e.g., omitting
+                # trailing empty parts in Parent.$$Field1$Field2 values).
+                idx = ext_idx[h]
+                aligned_row.append(row[idx] if idx < len(row) else "")
+            elif h.startswith("$$"):
+                # Composite key column not in extraction -- build from components
+                components = parse_composite_key_header(h)
+                aligned_row.append(build_composite_key_column(row_dict, components))
+            elif "." in h and "$$" in h:
+                # Nested composite reference not in extraction -- build from
+                # parent relationship + component fields
+                dot_idx = h.index(".")
+                parent = h[:dot_idx]
+                composite = h[dot_idx + 1:]
+                components = parse_composite_key_header(composite)
+                full_components = [f"{parent}.{c}" for c in components]
+                aligned_row.append(build_composite_key_column(row_dict, full_components))
+            else:
+                if verbose:
+                    print(f"    WARNING: Plan column '{h}' not found in extraction for {object_name}")
+                aligned_row.append("")
+        aligned_rows.append(aligned_row)
+
+    return aligned_headers, aligned_rows
+
+
+def normalize_na_values(rows: list, headers: list) -> list:
+    """Replace SFDMU v5 #N/A notation with empty strings for portable output.
+
+    SFDMU v5 uses #N/A to represent explicit nulls.  On import, #N/A instructs
+    SFDMU to overwrite the target field with null, whereas an empty string
+    causes the field to be skipped (left untouched).  For plan CSVs we want
+    the "skip" behaviour so that system-populated or default values are not
+    wiped on subsequent imports.
+
+    Also handles #N/A components embedded inside semicolon-delimited composite
+    key columns ($$Field1$Field2 notation).
+    """
+    na_marker = "#N/A"
+    # Pre-compute which columns are composite keys
+    composite_idx = {i for i, h in enumerate(headers) if "$$" in h}
+
+    new_rows = []
+    for row in rows:
+        new_row = []
+        for i, v in enumerate(row):
+            if v == na_marker:
+                new_row.append("")
+            elif i in composite_idx and na_marker in v:
+                # Normalize #N/A components within composite key values
+                parts = v.split(";")
+                parts = ["" if p == na_marker else p for p in parts]
+                # Collapse to empty if all components are empty
+                joined = ";".join(parts)
+                new_row.append("" if all(p == "" for p in parts) else joined)
+            else:
+                new_row.append(v)
+        new_rows.append(new_row)
+    return new_rows
+
+
+def write_csv(path: str, headers: list, rows: list) -> None:
+    """Write a CSV file with the given headers and rows.
+
+    Uses LF line endings to match .gitattributes (eol=lf for *.csv).
+    Python's csv.writer defaults to CRLF per RFC 4180; we override
+    with lineterminator='\\n' to stay consistent with the repo convention.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f, lineterminator="\n")
+        writer.writerow(headers)
+        writer.writerows(rows)
+
+
+def diff_csvs(plan_headers: list, plan_rows: list,
+              proc_headers: list, proc_rows: list,
+              object_name: str, key_columns: list) -> dict:
+    """Compare plan CSV against processed extraction and return a diff report.
+
+    Returns dict with:
+      - "new_records": records in extraction but not in plan
+      - "missing_records": records in plan but not in extraction
+      - "changed_records": records with same key but different values
+      - "identical": count of unchanged records
+    """
+    report = {
+        "new_records": [],
+        "missing_records": [],
+        "changed_records": [],
+        "identical": 0,
+    }
+
+    if plan_headers is None or proc_headers is None:
+        if proc_headers and proc_rows:
+            report["new_records"] = proc_rows
+        return report
+
+    # Build key indices based on matching plan_headers
+    plan_key_idx = [plan_headers.index(k) for k in key_columns if k in plan_headers]
+    proc_key_idx = [proc_headers.index(k) for k in key_columns if k in proc_headers]
+
+    if not plan_key_idx or not proc_key_idx:
+        return report
+
+    def make_key(row, indices):
+        return tuple(row[i] if i < len(row) else "" for i in indices)
+
+    plan_map = {}
+    for row in plan_rows:
+        key = make_key(row, plan_key_idx)
+        plan_map[key] = row
+
+    proc_map = {}
+    for row in proc_rows:
+        key = make_key(row, proc_key_idx)
+        proc_map[key] = row
+
+    for key, proc_row in proc_map.items():
+        if key not in plan_map:
+            report["new_records"].append(proc_row)
+        elif proc_row != plan_map[key]:
+            report["changed_records"].append((plan_map[key], proc_row))
+        else:
+            report["identical"] += 1
+
+    for key in plan_map:
+        if key not in proc_map:
+            report["missing_records"].append(plan_map[key])
+
+    return report
+
+
+def get_key_columns(plan_headers: list, external_id: str) -> list:
+    """Determine which columns to use as the diff key.
+
+    Parses the externalId (semicolon-separated components) and maps each
+    component to a CSV column.  Components may be:
+      - Simple fields: "StockKeepingUnit" or "Product.StockKeepingUnit"
+      - Relationship traversals: "RateCardEntry.RateCard.Name"
+      - Legacy composite key references: "RateCardEntry.$$..." (deprecated)
+
+    Plan CSVs now use individual relationship traversal fields instead of
+    $$ composite key notation, for SOQL compatibility during Upsert operations.
+
+    Falls back to all columns if no externalId fields found.
+    """
+    # `externalId`, like `query`, comes straight from a hand-editable export.json. A
+    # non-string value (e.g. a JSON list ["Name"]) is not caught by the `not external_id`
+    # check when populated and would raise AttributeError at `.split(";")` below, aborting
+    # the run — the same crash class the query guards above close (todo pack 182). Treat a
+    # non-string externalId as "no key" and fall back to all columns.
+    if not isinstance(external_id, str) or not external_id or external_id == "Id":
+        return list(plan_headers) if plan_headers else []
+
+    # Split externalId on ";" but be aware that composite key references
+    # (containing $$) are single components even though they contain $
+    parts = external_id.split(";")
+    key_cols = []
+    for p in parts:
+        if plan_headers and p in plan_headers:
+            key_cols.append(p)
+
+    if not key_cols and plan_headers:
+        # Try the full composite $$-prefixed column as a single key
+        composite = "$$" + "$".join(parts)
+        if composite in plan_headers:
+            key_cols.append(composite)
+
+    return key_cols if key_cols else (list(plan_headers) if plan_headers else [])
+
+
+# CSVs that SFDMU/the run emits but are not part of a plan's tracked data set.
+SKIP_PLAN_CSVS = {"MissingParentRecordsReport.csv", "CSVIssuesReport.csv"}
+
+
+def data_csvs(directory: str) -> set:
+    """CSV files in a plan/extraction dir that represent plan data (excludes run reports)."""
+    if not directory or not os.path.isdir(directory):
+        return set()
+    return {
+        f for f in os.listdir(directory)
+        if f.endswith(".csv") and f not in SKIP_PLAN_CSVS and not f.startswith("_")
+    }
+
+
+def clean_incidental_copy(src: str, dst: str) -> None:
+    """Copy a raw incidental CSV into the plan with header normalization and #N/A -> empty.
+
+    Incidental CSVs (FK-reference objects SFDMU pulls but that aren't plan objects, e.g.
+    UnitOfMeasure on the rates plan) don't go through align_columns, so normalize them
+    directly to the clean, import-ready format used by the committed plan CSVs.
+    """
+    with open(src, "r", newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        open(dst, "w").close()
+        return
+    header = [normalize_header(h) for h in rows[0]]
+    body = [["" if v == "#N/A" else v for v in r] for r in rows[1:]]
+    write_csv(dst, header, body)
+
+
+def header_only_copy(ref_csv: str, dst: str) -> None:
+    """Write a header-only placeholder from the reference CSV (no data rows).
+
+    Used for objects with 0 records in the source org: keeps the plan's file set
+    uniform with the reference schema without copying the reference's data.
+    """
+    with open(ref_csv, "r", newline="", encoding="utf-8-sig") as f:
+        first = f.readline()
+    with open(dst, "w", newline="", encoding="utf-8") as f:
+        if first.strip():
+            f.write(first.rstrip("\r\n") + "\n")
+
+
+def sync_to_plan(plan_dir: str, extraction_dir: str, output_dir: str,
+                 reference_plan_dir: str = None, verbose: bool = False) -> None:
+    """Place a freshly-processed extraction into the plan dir as its tracked CSV set.
+
+    The target file set is the reference plan's data CSVs when a reference is given
+    (so the variant plan stays uniform with qb), else the plan's own data CSVs plus
+    whatever plan objects were processed.  For each target CSV: a processed plan-object
+    CSV is copied; otherwise a raw incidental CSV is cleaned and copied; otherwise a
+    header-only placeholder is written from the reference (0-record object).
+    objectset_source/ (Pass 2+) is copied from the processed output when present.
+    Non-destructive: plan CSVs outside the target set are left in place and reported.
+    """
+    # Prefer the plan's OWN existing CSV set so copy_to_plan respects a variant plan's
+    # intentional object set: q3 mirrors only the qb objects it shares ("shared objects
+    # only — don't add qb-only objects"), so it must not gain CSVs for qb-only objects.
+    # Fall back to the reference set only for a brand-new plan with no CSVs yet (seeded by
+    # copying the qb export.json, so it fully mirrors qb and wants qb's full file set).
+    if data_csvs(plan_dir):
+        target = data_csvs(plan_dir) | data_csvs(output_dir)
+    elif reference_plan_dir:
+        target = data_csvs(reference_plan_dir)
+    else:
+        target = data_csvs(output_dir)
+    from_proc, from_raw, placeholder, missing = [], [], [], []
+    for name in sorted(target):
+        dst = os.path.join(plan_dir, name)
+        processed = os.path.join(output_dir, name)
+        raw = os.path.join(extraction_dir, name)
+        ref = os.path.join(reference_plan_dir, name) if reference_plan_dir else None
+        if os.path.isfile(processed):
+            shutil.copy2(processed, dst)
+            from_proc.append(name)
+        elif os.path.isfile(raw):
+            clean_incidental_copy(raw, dst)
+            from_raw.append(name)
+        elif ref and os.path.isfile(ref):
+            header_only_copy(ref, dst)
+            placeholder.append(name)
+        else:
+            missing.append(name)
+
+    src_os = os.path.join(output_dir, "objectset_source")
+    if os.path.isdir(src_os):
+        for root, _, files in os.walk(src_os):
+            rel = os.path.relpath(root, src_os)
+            ddir = os.path.join(plan_dir, "objectset_source") if rel == "." else \
+                os.path.join(plan_dir, "objectset_source", rel)
+            os.makedirs(ddir, exist_ok=True)
+            for fn in files:
+                if fn.endswith(".csv"):
+                    shutil.copy2(os.path.join(root, fn), os.path.join(ddir, fn))
+
+    print(f"  Synced to plan {plan_dir}: {len(from_proc)} processed, "
+          f"{len(from_raw)} incidental, {len(placeholder)} placeholder")
+    if verbose and (from_raw or placeholder):
+        print(f"    incidental (cleaned): {from_raw}")
+        print(f"    header-only placeholders (0-record objects): {placeholder}")
+    if missing:
+        print(f"    NOT produced by extraction (left as-is): {missing}")
+    # Heads-up on plan CSVs outside the target set (possible stale object-set drift).
+    extras = sorted(data_csvs(plan_dir) - target)
+    if extras:
+        print(f"    note: plan has CSVs not in the reference set (not refreshed): {extras}")
+
+
+def process_extraction(extraction_dir: str, plan_dir: str, output_dir: str,
+                        diff_only: bool, copy_to_plan: bool, verbose: bool,
+                        reference_plan_dir: str = None, code_map_file: str = None) -> None:
+    """Main post-processing logic.
+
+    When ``reference_plan_dir`` is given, the extracted CSVs are aligned to the
+    reference plan's CSV column schema (the "golden" format) rather than to the
+    target plan's own CSVs.  This is how a freshly-extracted variant plan
+    (e.g. q3-rates) is made UNIFORM with its qb reference (qb-rates): the column
+    set / composite-key headers come from qb, the row data comes from the org.
+    Without it the post-process conforms output to whatever CSV already sits in
+    the plan dir — which silently propagates a stale schema (e.g. .Name keys
+    instead of .Code/.UnitCode).
+    """
+    export_json = load_export_json(plan_dir)
+    plan_structure, all_passes, malformed = parse_plan_structure(export_json)
+
+    # Fail fast on a malformed declaration rather than dropping it. A dropped object is
+    # skipped by the processing loop below, but under --copy-to-plan sync_to_plan would
+    # still find its raw extracted CSV and copy it over the tracked plan CSV as
+    # "incidental" — bypassing status rewrites, ID resolution, defaults, and column
+    # alignment, and exiting 0. That silently corrupts plan data, so refuse to proceed
+    # (the validator flags the same shape as Severity.HIGH; this command exits CRITICAL).
+    if malformed:
+        export_path = os.path.join(plan_dir, "export.json")
+        print("\n" + "=" * 80)
+        print(f"CRITICAL: {len(malformed)} malformed object declaration(s) in {export_path} —")
+        print("each has a `query` that cannot be parsed to an object name "
+              "(non-string, or missing a FROM clause):")
+        for md in malformed:
+            print(f"  pass {md['pass_index'] + 1}: query={md['query']!r}")
+        print("Refusing to proceed: dropping a declaration would let --copy-to-plan sync the "
+              "raw extracted CSV over the tracked plan CSV, bypassing all processing.")
+        print("=" * 80)
+        raise SystemExit(1)
+
+    code_map = load_code_map(code_map_file)
+
+    # Find extracted CSV files
+    extracted_files = [f for f in os.listdir(extraction_dir) if f.endswith(".csv")]
+    extracted_objects = {os.path.splitext(f)[0]: f for f in extracted_files}
+
+    if not extracted_objects:
+        print("No CSV files found in extraction directory.")
+        return
+
+    print(f"Found {len(extracted_objects)} extracted CSV files")
+    print(f"Plan has {len(plan_structure)} objects configured")
+    print()
+
+    os.makedirs(output_dir, exist_ok=True)
+    diff_report = {}
+
+    for obj_name in sorted(extracted_objects.keys()):
+        # Skip SFDMU internal files
+        if obj_name.startswith("_") or obj_name in ("MissingParentRecordsReport", "CSVIssuesReport"):
+            continue
+
+        config = plan_structure.get(obj_name)
+        if not config:
+            if verbose:
+                print(f"  SKIP {obj_name} (not in export.json)")
+            continue
+
+        print(f"  Processing {obj_name}...")
+
+        # Load extracted data
+        ext_headers, ext_rows = load_extracted_csv(extraction_dir, obj_name)
+        if ext_headers is None:
+            continue
+
+        # Restore cross-object externalId code components (UsageResource.Code,
+        # RateUnitOfMeasure.UnitCode, ...) that SFDMU blanked to #N/A, using the
+        # org-derived Name->Code map.  Runs before alignment so composite keys are
+        # rebuilt from the restored values.
+        ext_rows = backfill_relationship_codes(ext_headers, ext_rows, obj_name, code_map, verbose)
+
+        # Load existing plan CSV for diff (the prior state of THIS plan).
+        plan_headers, plan_rows = load_plan_csv(plan_dir, obj_name)
+
+        # Determine the alignment template (the target column schema).  Prefer the
+        # reference plan's golden schema so output is uniform with qb; fall back to
+        # this plan's own CSV when no reference is available for the object.
+        template_headers = plan_headers
+        if reference_plan_dir:
+            ref_headers, _ = load_plan_csv(reference_plan_dir, obj_name)
+            if ref_headers is not None:
+                template_headers = ref_headers
+                if verbose:
+                    print(f"    Aligning to reference schema from {reference_plan_dir}")
+            elif verbose:
+                print(f"    No reference CSV for {obj_name}; aligning to plan's own schema")
+
+        # Rewrite status fields
+        ext_rows = rewrite_status(ext_rows, ext_headers, obj_name)
+
+        # Resolve raw Salesforce IDs in text fields to portable values
+        ext_rows = resolve_id_text_fields(ext_rows, ext_headers, obj_name, verbose)
+
+        # Populate field defaults for portability across org configurations
+        ext_rows = apply_field_defaults(ext_rows, ext_headers, obj_name, verbose)
+
+        # Align columns to the template (golden reference, or plan's own) schema
+        proc_headers, proc_rows = align_columns(
+            ext_headers, ext_rows, template_headers, obj_name, verbose
+        )
+
+        # Normalize #N/A to empty strings for safe, idempotent imports
+        proc_rows = normalize_na_values(proc_rows, proc_headers)
+
+        # Diff the freshly-aligned output against this plan's prior CSV.  Key
+        # columns come from the template so the diff keys on the golden schema;
+        # when the prior plan CSV used a different schema the diff degrades to
+        # "all new" (still informative — it signals the schema changed).
+        if plan_headers is not None:
+            key_cols = get_key_columns(template_headers, config.get("externalId", ""))
+            report = diff_csvs(plan_headers, plan_rows, proc_headers, proc_rows, obj_name, key_cols)
+            diff_report[obj_name] = report
+
+            if verbose or report["new_records"] or report["missing_records"] or report["changed_records"]:
+                print(f"    Identical: {report['identical']}, "
+                      f"New: {len(report['new_records'])}, "
+                      f"Changed: {len(report['changed_records'])}, "
+                      f"Missing: {len(report['missing_records'])}")
+
+        if not diff_only:
+            # Write processed CSV
+            out_path = os.path.join(output_dir, f"{obj_name}.csv")
+            write_csv(out_path, proc_headers, proc_rows)
+
+    # Handle objectset_source for multi-pass plans
+    if not diff_only:
+        generate_objectset_source(extraction_dir, plan_dir, output_dir, all_passes,
+                                  verbose, reference_plan_dir)
+        # Place the processed extraction into the plan dir as its tracked CSV set
+        # (processed plan objects + cleaned incidental + header-only placeholders).
+        if copy_to_plan:
+            sync_to_plan(plan_dir, extraction_dir, output_dir, reference_plan_dir, verbose)
+
+    # Print diff summary
+    print_diff_summary(diff_report)
+
+
+def generate_objectset_source(extraction_dir: str, plan_dir: str, output_dir: str,
+                                all_passes: dict, verbose: bool,
+                                reference_plan_dir: str = None) -> None:
+    """Generate objectset_source CSVs for Pass 2+ objects.
+
+    For objects that appear in multiple passes, create stripped-down CSVs
+    matching the objectset_source format (usually just external ID + Status).
+
+    The column structure is taken from the plan's own objectset_source CSVs when
+    present, else from the reference plan's objectset_source (so a freshly-extracted
+    variant plan stays uniform with its qb reference even for Pass 2+).
+    """
+    existing_source_dir = os.path.join(plan_dir, "objectset_source")
+    if not os.path.isdir(existing_source_dir) and reference_plan_dir:
+        ref_source_dir = os.path.join(reference_plan_dir, "objectset_source")
+        if os.path.isdir(ref_source_dir):
+            existing_source_dir = ref_source_dir
+            if verbose:
+                print(f"  Using reference objectset_source: {ref_source_dir}")
+    if not os.path.isdir(existing_source_dir):
+        return
+
+    print("\n  Generating objectset_source CSVs...")
+    for obj_name, passes in all_passes.items():
+        if len(passes) < 2:
+            continue
+
+        for pass_idx, config in passes[1:]:
+            set_name = f"object-set-{pass_idx + 1}"
+            existing_csv_path = os.path.join(existing_source_dir, set_name, f"{obj_name}.csv")
+            if not os.path.isfile(existing_csv_path):
+                continue
+
+            # Read the existing objectset_source CSV to get its column structure
+            with open(existing_csv_path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                source_headers = next(reader, None)
+
+            if not source_headers:
+                continue
+
+            # Load extracted data for this object
+            ext_headers, ext_rows = load_extracted_csv(extraction_dir, obj_name)
+            if ext_headers is None:
+                continue
+
+            # Build rows with only the columns needed for this pass
+            ext_idx = {h: i for i, h in enumerate(ext_headers)}
+            source_rows = []
+            for row in ext_rows:
+                source_row = []
+                for h in source_headers:
+                    if h in ext_idx:
+                        idx = ext_idx[h]
+                        source_row.append(row[idx] if idx < len(row) else "")
+                    else:
+                        source_row.append("")
+                source_rows.append(source_row)
+
+            # Write to output objectset_source
+            out_dir = os.path.join(output_dir, "objectset_source", set_name)
+            write_csv(os.path.join(out_dir, f"{obj_name}.csv"), source_headers, source_rows)
+            if verbose:
+                print(f"    {set_name}/{obj_name}.csv ({len(source_rows)} rows)")
+
+
+def print_diff_summary(diff_report: dict) -> None:
+    """Print a summary of all diffs."""
+    if not diff_report:
+        return
+
+    print("\n" + "=" * 80)
+    print("DIFF SUMMARY: Extraction vs Current Plan")
+    print("=" * 80)
+    print(f"{'Object':<45} {'Same':>6} {'New':>6} {'Chg':>6} {'Miss':>6}")
+    print("-" * 80)
+
+    total_identical = 0
+    total_new = 0
+    total_changed = 0
+    total_missing = 0
+
+    for obj_name in sorted(diff_report.keys()):
+        r = diff_report[obj_name]
+        n_id = r["identical"]
+        n_new = len(r["new_records"])
+        n_chg = len(r["changed_records"])
+        n_miss = len(r["missing_records"])
+        total_identical += n_id
+        total_new += n_new
+        total_changed += n_chg
+        total_missing += n_miss
+
+        flag = "" if (n_new == 0 and n_chg == 0 and n_miss == 0) else " *"
+        print(f"{obj_name:<45} {n_id:>6} {n_new:>6} {n_chg:>6} {n_miss:>6}{flag}")
+
+    print("-" * 80)
+    print(f"{'TOTAL':<45} {total_identical:>6} {total_new:>6} {total_changed:>6} {total_missing:>6}")
+    print()
+    if total_new or total_changed or total_missing:
+        print("Objects marked with * have differences.")
+    else:
+        print("Extraction matches current plan exactly.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Post-process SFDMU extraction output into import-ready CSVs"
+    )
+    parser.add_argument("extraction_dir", help="Path to the directory containing extracted CSVs")
+    parser.add_argument("plan_dir", help="Path to the data plan directory (contains export.json and plan CSVs)")
+    parser.add_argument("--output-dir", default=None,
+                        help="Output directory for processed CSVs (default: <extraction_dir>/processed/)")
+    parser.add_argument("--reference-plan-dir", default=None,
+                        help=("Align output columns to this reference plan's CSV schema (the "
+                              "golden format, e.g. the qb sibling) instead of the target plan's "
+                              "own CSVs.  Makes a freshly-extracted variant plan uniform with qb."))
+    parser.add_argument("--code-map-file", default=None,
+                        help=("Path to a JSON {Object: {Rel.CodeField: {Name: Code}}} map used to "
+                              "backfill cross-object externalId code components (e.g. "
+                              "UsageResource.Code) that SFDMU blanks to #N/A during extraction."))
+    parser.add_argument("--diff-only", action="store_true",
+                        help="Only produce a diff report; don't write processed CSVs")
+    parser.add_argument("--copy-to-plan", action="store_true",
+                        help="Copy processed CSVs into the plan directory")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print detailed processing info")
+
+    args = parser.parse_args()
+
+    extraction_dir = os.path.abspath(args.extraction_dir)
+    plan_dir = os.path.abspath(args.plan_dir)
+    output_dir = args.output_dir or os.path.join(extraction_dir, "processed")
+    reference_plan_dir = os.path.abspath(args.reference_plan_dir) if args.reference_plan_dir else None
+    code_map_file = os.path.abspath(args.code_map_file) if args.code_map_file else None
+
+    if not os.path.isdir(extraction_dir):
+        print(f"ERROR: Extraction directory not found: {extraction_dir}", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.isdir(plan_dir):
+        print(f"ERROR: Plan directory not found: {plan_dir}", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.isfile(os.path.join(plan_dir, "export.json")):
+        print(f"ERROR: export.json not found in plan directory: {plan_dir}", file=sys.stderr)
+        sys.exit(1)
+    if reference_plan_dir and not os.path.isdir(reference_plan_dir):
+        print(f"ERROR: Reference plan directory not found: {reference_plan_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Extraction dir: {extraction_dir}")
+    print(f"Plan dir:       {plan_dir}")
+    print(f"Output dir:     {output_dir}")
+    print(f"Reference dir:  {reference_plan_dir or '(none; align to this plan CSVs)'}")
+    print(f"Diff only:      {args.diff_only}")
+    print(f"Copy to plan:   {args.copy_to_plan}")
+    print()
+
+    process_extraction(
+        extraction_dir=extraction_dir,
+        plan_dir=plan_dir,
+        output_dir=output_dir,
+        diff_only=args.diff_only,
+        copy_to_plan=args.copy_to_plan,
+        verbose=args.verbose,
+        reference_plan_dir=reference_plan_dir,
+        code_map_file=code_map_file,
+    )
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()

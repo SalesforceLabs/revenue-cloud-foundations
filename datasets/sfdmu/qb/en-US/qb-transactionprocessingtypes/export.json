@@ -1,0 +1,13 @@
+{
+  "apiVersion": "68.0",
+  "excludeIdsFromCSVFiles": "true",
+  "objects": [
+    {
+      "query": "SELECT Description, DeveloperName, Language, MasterLabel, RuleEngine, SaveType, PricingPreference, RatingPreference, TaxPreference FROM TransactionProcessingType",
+      "operation": "Upsert",
+      "externalId": "DeveloperName",
+      "excluded": false
+    }
+  ],
+  "orgs": []
+}

@@ -1,0 +1,695 @@
+"""
+CumulusCI task to validate the local developer setup for rlm-base-dev.
+
+Checks Python, CumulusCI, Salesforce CLI, SFDMU plugin version, Node.js,
+and Robot Framework dependencies (Robot, selenium, SeleniumLibrary,
+webdriver-manager, Chrome/Chromium, ChromeDriver, urllib3). Optionally
+auto-fixes an outdated or missing SFDMU plugin (auto_fix), robot
+dependencies via pipx inject (auto_fix_robot, on by default), and urllib3
+via pipx inject (auto_fix_urllib3, off by default).
+
+Run without an org:
+    cci task run validate_setup
+
+Options:
+    auto_fix                Auto-update SFDMU if outdated (default: true)
+    auto_fix_robot          Auto-install robot deps via pipx inject if missing (default: true)
+    auto_fix_urllib3        Auto-install/upgrade urllib3 if missing or outdated (default: false)
+    required_sfdmu_version  Minimum SFDMU version (default: 5.6.4)
+    fail_on_error           Raise on required check failures (default: true)
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    from cumulusci.core.exceptions import TaskOptionsError
+    from cumulusci.core.tasks import BaseTask
+except ImportError:
+    BaseTask = object  # type: ignore[assignment,misc]
+    TaskOptionsError = Exception  # type: ignore[assignment,misc]
+
+# ── minimum required versions ────────────────────────────────────────────────
+# Bumped 3.8 -> 3.10 to match the schema-diff / skill-manifest scripts which
+# use PEP 604 union syntax (`X | None`, `list[Path]`). The CI workflow pins
+# 3.13 and `docs/guides/dev-environment-setup.md` defaults to 3.13 already,
+# so 3.10 is a generous floor.
+MIN_PYTHON: Tuple[int, ...] = (3, 10)
+MIN_CCI: Tuple[int, ...] = (4, 0, 0)
+MIN_SF_MAJOR: int = 2
+# 5.6.4 is the floor (not just 5.x): 5.6.4 fixed upsert matching for
+# relationship externalIds (5.6.4 release, commit 50be987) — qb-prm/qb-prm-pricing upserts
+# ChannelProgramMember on Partner.Name;Program.Name and duplicates it on every
+# rerun with older plugins — and 5.6.3 fixed the #N/A/N/A null-token
+# semantics the extraction post-processing relies on.
+MIN_SFDMU_DEFAULT: str = "5.6.4"
+MIN_URLLIB3: Tuple[int, ...] = (2, 6, 3)
+MIN_URLLIB3_STR: str = "2.6.3"
+MIN_SELENIUM: Tuple[int, ...] = (4, 10)
+MIN_SELENIUM_STR: str = "4.10"
+
+# ── status tokens ────────────────────────────────────────────────────────────
+PASS = "PASS"
+WARN = "WARN"
+FAIL = "FAIL"
+FIXED = "FIXED"
+
+
+def _parse_version(version_str: str) -> Tuple[int, ...]:
+    """Parse '4.38.0' → (4, 38, 0). Non-numeric segments stop the parse."""
+    parts: List[int] = []
+    for segment in version_str.strip().lstrip("v").split("."):
+        try:
+            parts.append(int(segment))
+        except ValueError:
+            break
+    return tuple(parts) if parts else (0,)
+
+
+class ValidateSetup(BaseTask):
+    """Validate the local developer setup for rlm-base-dev.
+
+    Checks each required tool and version, logs a clear pass/warn/fail result
+    for each, and prints a summary. When auto_fix=true the SFDMU plugin is
+    automatically installed or updated if it is absent or below the required
+    version. When auto_fix_robot=true (default), missing Robot Framework
+    dependencies are automatically installed via ``pipx inject cumulusci -r
+    robot/requirements.txt``. When auto_fix_urllib3=true, urllib3 may also be
+    installed or upgraded via pipx inject (default false). Chrome/Chromium is
+    never auto-installed (requires a manual ``brew install --cask google-chrome``).
+    """
+
+    task_options: Dict[str, Dict[str, Any]] = {
+        "auto_fix": {
+            "description": (
+                "Automatically install or update the SFDMU plugin when it is "
+                "missing or below required_sfdmu_version. Default: true."
+            ),
+            "required": False,
+        },
+        "auto_fix_robot": {
+            "description": (
+                "When true, run pipx inject cumulusci --force -r robot/requirements.txt "
+                "to install missing Robot Framework dependencies (robotframework, "
+                "robotframework-seleniumlibrary, selenium, webdriver-manager, urllib3). "
+                "Default: true — robot tasks are required and deps are auto-installed "
+                "on first run."
+            ),
+            "required": False,
+        },
+        "auto_fix_urllib3": {
+            "description": (
+                "When true, run pipx inject to install or upgrade urllib3 in the "
+                "CumulusCI environment if it is missing or below the minimum "
+                f"version ({MIN_URLLIB3_STR}). Independent of auto_fix (which "
+                "only affects SFDMU). Default: false — urllib3 is optional and "
+                "env changes are opt-in."
+            ),
+            "required": False,
+        },
+        "required_sfdmu_version": {
+            "description": (
+                f"Minimum required SFDMU plugin version. Default: {MIN_SFDMU_DEFAULT}. "
+                "SFDMU v5 is required — v4.x has been deprecated. The project's "
+                "export.json files and CSV data are formatted for v5 compatibility."
+            ),
+            "required": False,
+        },
+        "fail_on_error": {
+            "description": (
+                "Raise a task exception when one or more required checks fail. "
+                "Warnings (optional dependencies) never cause a failure. Default: true."
+            ),
+            "required": False,
+        },
+    }
+
+    # ── entry point ───────────────────────────────────────────────────────────
+
+    def _run_task(self) -> None:
+        auto_fix = self._bool_option("auto_fix", default=True)
+        auto_fix_robot = self._bool_option("auto_fix_robot", default=True)
+        auto_fix_urllib3 = self._bool_option("auto_fix_urllib3", default=False)
+        fail_on_error = self._bool_option("fail_on_error", default=True)
+        required_sfdmu = self.options.get("required_sfdmu_version") or MIN_SFDMU_DEFAULT
+
+        # Tracks whether _install_robot_deps() has already been attempted/succeeded.
+        self._robot_deps_fixed: bool = False    # True → inject succeeded
+        self._robot_deps_attempted: bool = False  # True → inject ran (success or failure)
+
+        self.logger.info("=" * 60)
+        self.logger.info("Validating developer setup for rlm-base-dev...")
+        self.logger.info("=" * 60)
+
+        results: List[Dict[str, str]] = [
+            self._check_python(),
+            self._check_cumulusci(),
+            self._check_node(),
+            self._check_sf_cli(),
+            self._check_sfdmu(required_sfdmu, auto_fix),
+            self._check_robot(auto_fix_robot),
+            self._check_selenium(auto_fix_robot),
+            self._check_selenium_library(auto_fix_robot),
+            self._check_webdriver_manager(auto_fix_robot),
+            self._check_chrome_chromium(),
+            self._check_chromedriver(auto_fix_robot),
+            self._check_urllib3(auto_fix_urllib3),
+        ]
+
+        self._log_summary(results)
+
+        if fail_on_error:
+            failures = [r for r in results if r["status"] == FAIL]
+            if failures:
+                labels = ", ".join(r["label"] for r in failures)
+                raise TaskOptionsError(f"Setup validation failed for: {labels}")
+
+    # ── individual checks ─────────────────────────────────────────────────────
+
+    def _check_python(self) -> Dict[str, str]:
+        label = "Python"
+        current = sys.version_info[:3]
+        ver_str = ".".join(str(x) for x in current)
+        min_str = ".".join(str(x) for x in MIN_PYTHON)
+        if current >= MIN_PYTHON:
+            return self._ok(label, ver_str)
+        return self._fail(label, f"{ver_str} — requires {min_str}+")
+
+    def _check_cumulusci(self) -> Dict[str, str]:
+        label = "CumulusCI"
+        try:
+            import cumulusci  # noqa: PLC0415
+
+            ver_str = getattr(cumulusci, "__version__", "unknown")
+            min_str = ".".join(str(x) for x in MIN_CCI)
+            if _parse_version(ver_str) >= MIN_CCI:
+                return self._ok(label, ver_str)
+            return self._fail(label, f"{ver_str} — requires {min_str}+")
+        except ImportError:
+            return self._fail(label, "not importable in current environment")
+
+    def _check_node(self) -> Dict[str, str]:
+        label = "Node.js"
+        try:
+            result = subprocess.run(
+                ["node", "--version"], capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                return self._ok(label, result.stdout.strip())
+            return self._warn(label, "installed but returned a non-zero exit code")
+        except FileNotFoundError:
+            return self._warn(
+                label,
+                "not found — Node.js is required to run the npm-installed sf CLI and its plugins (including SFDMU). "
+                "Download from https://nodejs.org or use a version manager such as nvm "
+                "(on macOS: brew install nvm && nvm install --lts).",
+            )
+        except Exception as exc:
+            return self._warn(label, f"check failed: {exc}")
+
+    def _check_sf_cli(self) -> Dict[str, str]:
+        label = "Salesforce CLI (sf)"
+        try:
+            result = subprocess.run(
+                ["sf", "--version"], capture_output=True, text=True, timeout=20
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "").strip()
+                msg = f"command failed (exit {result.returncode})"
+                if detail:
+                    msg += f": {detail[:200]}"
+                return self._fail(label, msg)
+            first_line = result.stdout.strip().split("\n")[0]
+            match = re.search(r"@salesforce/cli/(\d+)\.(\d+)\.(\d+)", first_line)
+            if match:
+                major = int(match.group(1))
+                ver_str = f"{match.group(1)}.{match.group(2)}.{match.group(3)}"
+                if major >= MIN_SF_MAJOR:
+                    return self._ok(label, ver_str)
+                return self._fail(label, f"{ver_str} — requires v{MIN_SF_MAJOR}+")
+            return self._ok(label, first_line)
+        except FileNotFoundError:
+            return self._fail(
+                label,
+                "not found — install from https://developer.salesforce.com/tools/salesforcecli",
+            )
+        except Exception as exc:
+            return self._fail(label, f"check failed: {exc}")
+
+    def _check_sfdmu(self, required_version: str, auto_fix: bool) -> Dict[str, str]:
+        label = "SFDMU plugin"
+        installed_ver = self._get_sfdmu_version()
+
+        if installed_ver is None:
+            if auto_fix:
+                self.logger.info("[SFDMU] Plugin not installed. Installing now...")
+                return self._install_or_update_sfdmu(label)
+            return self._fail(
+                label,
+                "not installed — run: sf plugins install sfdmu",
+            )
+
+        req_tuple = _parse_version(required_version)
+        if _parse_version(installed_ver) >= req_tuple:
+            return self._ok(label, installed_ver)
+
+        if auto_fix:
+            self.logger.info(
+                f"[SFDMU] {installed_ver} is below required {required_version}. Updating..."
+            )
+            return self._install_or_update_sfdmu(label, old_ver=installed_ver)
+
+        return self._fail(
+            label,
+            f"{installed_ver} — requires {required_version}+. "
+            "Run: sf plugins install sfdmu",
+        )
+
+    def _check_robot(self, auto_fix: bool = False) -> Dict[str, str]:
+        label = "Robot Framework"
+        try:
+            import robot  # noqa: PLC0415
+
+            ver_str = getattr(
+                getattr(robot, "version", None), "VERSION", None
+            ) or getattr(robot, "__version__", "unknown")
+            return self._ok(label, ver_str)
+        except ImportError:
+            if auto_fix and self._install_robot_deps():
+                try:
+                    import importlib  # noqa: PLC0415
+                    robot_mod = importlib.import_module("robot")
+                    ver_str = getattr(
+                        getattr(robot_mod, "version", None), "VERSION", None
+                    ) or getattr(robot_mod, "__version__", "unknown")
+                    return self._fixed(label, ver_str)
+                except ImportError:
+                    pass
+            return self._fail(
+                label,
+                "not found in the CCI Python env — required for configure_revenue_settings "
+                "and other robot tasks (enable_document_builder_toggle, enable_constraints_settings, "
+                "enable_analytics_replication).\n"
+                "  Fix: pipx inject cumulusci --force -r robot/requirements.txt",
+            )
+
+    def _check_selenium(self, auto_fix: bool = False) -> Dict[str, str]:
+        label = "selenium"
+        try:
+            import selenium  # noqa: PLC0415
+
+            ver_str = getattr(selenium, "__version__", "unknown")
+            if _parse_version(ver_str) >= MIN_SELENIUM:
+                return self._ok(label, ver_str)
+            # Version too old — try auto-fix first
+            if auto_fix and self._install_robot_deps():
+                try:
+                    import importlib  # noqa: PLC0415
+                    for mod in list(sys.modules):
+                        if mod == "selenium" or mod.startswith("selenium."):
+                            sys.modules.pop(mod, None)
+                    sel_mod = importlib.import_module("selenium")
+                    new_ver = getattr(sel_mod, "__version__", "unknown")
+                    if _parse_version(new_ver) >= MIN_SELENIUM:
+                        return self._fixed(label, f"{ver_str} → {new_ver}")
+                except ImportError:
+                    pass
+            return self._fail(
+                label,
+                f"{ver_str} — requires {MIN_SELENIUM_STR}+ (executable_path removed in 4.10; "
+                "Service API required). Fix: pipx inject cumulusci --force -r robot/requirements.txt",
+            )
+        except ImportError:
+            if auto_fix and self._install_robot_deps():
+                try:
+                    import importlib  # noqa: PLC0415
+                    sel_mod = importlib.import_module("selenium")
+                    ver_str = getattr(sel_mod, "__version__", "unknown")
+                    if _parse_version(ver_str) >= MIN_SELENIUM:
+                        return self._fixed(label, ver_str)
+                except ImportError:
+                    pass
+            return self._fail(
+                label,
+                "not found in the CCI Python env — required for all robot tasks.\n"
+                "  Fix: pipx inject cumulusci --force -r robot/requirements.txt",
+            )
+
+    def _check_selenium_library(self, auto_fix: bool = False) -> Dict[str, str]:
+        label = "SeleniumLibrary"
+        try:
+            import SeleniumLibrary  # noqa: PLC0415,N813
+
+            ver_str = getattr(SeleniumLibrary, "__version__", "unknown")
+            return self._ok(label, ver_str)
+        except ImportError:
+            if auto_fix and self._install_robot_deps():
+                try:
+                    import importlib  # noqa: PLC0415
+                    sl_mod = importlib.import_module("SeleniumLibrary")
+                    ver_str = getattr(sl_mod, "__version__", "unknown")
+                    return self._fixed(label, ver_str)
+                except ImportError:
+                    pass
+            return self._fail(
+                label,
+                "not found in the CCI Python env — required for all robot tasks.\n"
+                "  Fix: pipx inject cumulusci --force -r robot/requirements.txt",
+            )
+
+    def _check_webdriver_manager(self, auto_fix: bool = False) -> Dict[str, str]:
+        label = "webdriver-manager"
+        try:
+            import webdriver_manager  # noqa: PLC0415
+
+            ver_str = getattr(webdriver_manager, "__version__", "unknown")
+            return self._ok(label, ver_str)
+        except ImportError:
+            if auto_fix and self._install_robot_deps():
+                try:
+                    import importlib  # noqa: PLC0415
+                    wdm_mod = importlib.import_module("webdriver_manager")
+                    ver_str = getattr(wdm_mod, "__version__", "unknown")
+                    return self._fixed(label, ver_str)
+                except ImportError:
+                    pass
+            return self._warn(
+                label,
+                "not installed (optional) — ChromeDriver will be resolved from PATH instead. "
+                "Install to enable automatic ChromeDriver management.\n"
+                "  Fix: pipx inject cumulusci webdriver-manager",
+            )
+
+    def _check_chrome_chromium(self) -> Dict[str, str]:
+        """Check for Chrome or Chromium browser (required for headless robot tasks)."""
+        label = "Chrome/Chromium"
+        # Check CHROME_BIN env (used in CI/Docker)
+        env_bin = os.environ.get("CHROME_BIN")
+        if env_bin and os.path.isfile(env_bin) and os.access(env_bin, os.X_OK):
+            return self._ok(label, env_bin)
+        # Common paths
+        candidates = [
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chrome",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ]
+        for path in candidates:
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return self._ok(label, path)
+        # Try PATH
+        for name in ("google-chrome", "chromium", "chromium-browser", "chrome"):
+            found = shutil.which(name)
+            if found:
+                return self._ok(label, found)
+        return self._fail(
+            label,
+            "not found — Chrome or Chromium is required for all robot tasks (headless mode via --headless=new).\n"
+            "  Install (macOS): brew install --cask google-chrome\n"
+            "  Or (Linux): install your distribution's chromium or google-chrome package",
+        )
+
+    def _check_chromedriver(self, auto_fix: bool = False) -> Dict[str, str]:
+        """Check for ChromeDriver (required for headless robot tasks)."""
+        label = "ChromeDriver"
+        # System chromedriver
+        if os.path.isfile("/usr/bin/chromedriver") and os.access("/usr/bin/chromedriver", os.X_OK):
+            return self._ok(label, "/usr/bin/chromedriver")
+        # PATH
+        path_chromedriver = shutil.which("chromedriver")
+        if path_chromedriver:
+            return self._ok(label, path_chromedriver)
+        # webdriver-manager can download at runtime
+        try:
+            import webdriver_manager  # noqa: PLC0415
+            return self._ok(label, "via webdriver-manager (downloads at runtime)")
+        except ImportError:
+            pass
+        # Try auto-fix (installs webdriver-manager via robot/requirements.txt)
+        if auto_fix and self._install_robot_deps():
+            try:
+                import importlib  # noqa: PLC0415
+                importlib.import_module("webdriver_manager")
+                return self._fixed(label, "via webdriver-manager (downloads ChromeDriver at runtime)")
+            except ImportError:
+                pass
+        return self._fail(
+            label,
+            "not found — ChromeDriver is required for all robot tasks.\n"
+            "  Fix: pipx inject cumulusci webdriver-manager (downloads ChromeDriver at runtime)\n"
+            "  Or: brew install chromedriver",
+        )
+
+    def _check_urllib3(self, auto_fix: bool = False) -> Dict[str, str]:
+        label = "urllib3"
+        try:
+            import urllib3  # noqa: PLC0415
+
+            ver_str = getattr(urllib3, "__version__", "unknown")
+            if _parse_version(ver_str) >= MIN_URLLIB3:
+                return self._ok(label, ver_str)
+
+            if auto_fix:
+                self.logger.info(
+                    f"[urllib3] {ver_str} is below {MIN_URLLIB3_STR}. Running pipx inject --force..."
+                )
+                return self._fix_urllib3(label, old_ver=ver_str)
+
+            return self._warn(
+                label,
+                f"{ver_str} is below the minimum {MIN_URLLIB3_STR} — known security vulnerabilities (CVE-2026-21441).\n"
+                f'  Fix: pipx inject cumulusci "urllib3>={MIN_URLLIB3_STR}" --force',
+            )
+        except ImportError:
+            if auto_fix:
+                self.logger.info("[urllib3] Not found in CCI env. Running pipx inject...")
+                return self._fix_urllib3(label)
+            return self._warn(
+                label,
+                "not found in the CCI Python env.\n"
+                f'  Fix: pipx inject cumulusci "urllib3>={MIN_URLLIB3_STR}" --force',
+            )
+
+    def _fix_urllib3(self, label: str, old_ver: Optional[str] = None) -> Dict[str, str]:
+        try:
+            result = subprocess.run(
+                ["pipx", "inject", "--force", "cumulusci", f"urllib3>={MIN_URLLIB3_STR}"],
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            if result.returncode != 0:
+                err = result.stderr.strip() or result.stdout.strip()
+                return self._warn(
+                    label,
+                    f"auto-fix failed: {err}\n"
+                    f'  Fix: pipx inject cumulusci "urllib3>={MIN_URLLIB3_STR}" --force',
+                )
+            # Clear cached urllib3 modules so import_module reads from disk, not from
+            # the already-loaded (old) entries in sys.modules.
+            try:
+                import importlib  # noqa: PLC0415
+                for name in list(sys.modules):
+                    if name == "urllib3" or name.startswith("urllib3."):
+                        sys.modules.pop(name, None)
+                urllib3 = importlib.import_module("urllib3")
+                new_ver = getattr(urllib3, "__version__", "unknown")
+            except Exception:
+                new_ver = "unknown"
+            detail = f"updated {old_ver} → {new_ver}" if old_ver else f"installed {new_ver}"
+            self.logger.warning(
+                "[urllib3] Auto-fix applied; a restart of this process may be required for the "
+                "upgrade to take full effect in libraries that imported the old urllib3 version."
+            )
+            return self._fixed(label, detail)
+        except Exception as exc:
+            return self._warn(
+                label,
+                f"auto-fix failed: {exc}\n"
+                f'  Fix: pipx inject cumulusci "urllib3>={MIN_URLLIB3_STR}" --force',
+            )
+
+    # ── Robot helpers ─────────────────────────────────────────────────────────
+
+    def _install_robot_deps(self) -> bool:
+        """Run ``pipx inject cumulusci --force -r robot/requirements.txt`` at most once per session.
+
+        Returns True if the install succeeded (or had already succeeded), False on failure.
+        After the first attempt (success or failure) ``self._robot_deps_attempted`` is set so
+        subsequent check methods skip a redundant retry and log consistently.
+        """
+        if self._robot_deps_attempted:
+            return self._robot_deps_fixed
+        self._robot_deps_attempted = True
+
+        requirements_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "robot",
+            "requirements.txt",
+        )
+        if not os.path.isfile(requirements_path):
+            self.logger.error(
+                f"[Robot] requirements file not found: {requirements_path}"
+            )
+            return False
+
+        self.logger.info(
+            "[Robot] Installing robot dependencies via pipx inject "
+            "(robot/requirements.txt) — this may take a moment..."
+        )
+        try:
+            result = subprocess.run(
+                ["pipx", "inject", "cumulusci", "--force", "-r", requirements_path],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if result.returncode != 0:
+                err = (result.stderr or result.stdout or "").strip()
+                self.logger.error(f"[Robot] pipx inject failed: {err}")
+                return False
+
+            # Evict cached module entries so subsequent imports resolve from the
+            # freshly installed packages. Include urllib3 because robot/requirements.txt
+            # pins urllib3>=2.6.3 and the in-memory version may be stale.
+            prefixes = ("robot", "SeleniumLibrary", "webdriver_manager", "urllib3")
+            for name in list(sys.modules):
+                if any(name == p or name.startswith(p + ".") for p in prefixes):
+                    sys.modules.pop(name, None)
+
+            self._robot_deps_fixed = True
+            return True
+        except Exception as exc:
+            self.logger.error(f"[Robot] pipx inject failed: {exc}")
+            return False
+
+    # ── SFDMU helpers ─────────────────────────────────────────────────────────
+
+    def _get_sfdmu_version(self) -> Optional[str]:
+        """Return the installed SFDMU version string, or None if not found."""
+        # Try JSON output first (structured, reliable)
+        try:
+            result = subprocess.run(
+                ["sf", "plugins", "--json"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                plugins = json.loads(result.stdout)
+                for plugin in plugins:
+                    if "sfdmu" in plugin.get("name", "").lower():
+                        return plugin.get("version")
+        except Exception:
+            pass
+
+        # Fall back to plain text output
+        try:
+            result = subprocess.run(
+                ["sf", "plugins"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    if "sfdmu" in line.lower():
+                        match = re.search(r"(\d+\.\d+\.\d+)", line)
+                        if match:
+                            return match.group(1)
+        except Exception:
+            pass
+
+        return None
+
+    def _install_or_update_sfdmu(
+        self, label: str, old_ver: Optional[str] = None
+    ) -> Dict[str, str]:
+        try:
+            result = subprocess.run(
+                ["sf", "plugins", "install", "sfdmu"],
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            if result.returncode != 0:
+                return self._fail(
+                    label,
+                    f"auto-install/update failed: {result.stderr.strip() or result.stdout.strip()}",
+                )
+            new_ver = self._get_sfdmu_version() or "unknown"
+            detail = f"updated {old_ver} → {new_ver}" if old_ver else f"installed {new_ver}"
+            return self._fixed(label, detail)
+        except Exception as exc:
+            return self._fail(label, f"auto-install/update failed: {exc}")
+
+    # ── summary ───────────────────────────────────────────────────────────────
+
+    def _log_summary(self, results: List[Dict[str, str]]) -> None:
+        passed = [r for r in results if r["status"] == PASS]
+        fixed = [r for r in results if r["status"] == FIXED]
+        warned = [r for r in results if r["status"] == WARN]
+        failed = [r for r in results if r["status"] == FAIL]
+
+        self.logger.info("")
+        self.logger.info("=" * 60)
+        self.logger.info("Setup Validation Summary")
+        self.logger.info("=" * 60)
+        self.logger.info(f"  Passed   : {len(passed)}")
+        if fixed:
+            self.logger.info(f"  Fixed    : {len(fixed)}")
+        if warned:
+            self.logger.info(f"  Warnings : {len(warned)}")
+        if failed:
+            self.logger.error(f"  Failed   : {len(failed)}")
+        self.logger.info("=" * 60)
+
+        if fixed:
+            self.logger.info("Auto-fixed:")
+            for r in fixed:
+                self.logger.info(f"  {r['label']}: {r['detail']}")
+
+        if warned:
+            self.logger.warning("Warnings (non-blocking):")
+            for r in warned:
+                self.logger.warning(f"  {r['label']}: {r['detail']}")
+
+        if failed:
+            self.logger.error("Failures (blocking):")
+            for r in failed:
+                self.logger.error(f"  {r['label']}: {r['detail']}")
+        else:
+            self.logger.info("All required checks passed.")
+
+    # ── result constructors ───────────────────────────────────────────────────
+
+    def _ok(self, label: str, detail: str) -> Dict[str, str]:
+        self.logger.info(f"  [PASS]  {label}: {detail}")
+        return {"label": label, "status": PASS, "detail": detail}
+
+    def _warn(self, label: str, detail: str) -> Dict[str, str]:
+        self.logger.warning(f"  [WARN]  {label}: {detail}")
+        return {"label": label, "status": WARN, "detail": detail}
+
+    def _fail(self, label: str, detail: str) -> Dict[str, str]:
+        self.logger.error(f"  [FAIL]  {label}: {detail}")
+        return {"label": label, "status": FAIL, "detail": detail}
+
+    def _fixed(self, label: str, detail: str) -> Dict[str, str]:
+        self.logger.info(f"  [FIXED] {label}: {detail}")
+        return {"label": label, "status": FIXED, "detail": detail}
+
+    # ── utility ───────────────────────────────────────────────────────────────
+
+    def _bool_option(self, key: str, default: bool) -> bool:
+        val = self.options.get(key)
+        if val is None:
+            return default
+        if isinstance(val, bool):
+            return val
+        return str(val).lower() not in ("false", "0", "no")
